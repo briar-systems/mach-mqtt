@@ -1,0 +1,8 @@
+use std.runtime;
+use print: std.print;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    print.println("brokerd: not yet implemented");
+    ret 0;
+}

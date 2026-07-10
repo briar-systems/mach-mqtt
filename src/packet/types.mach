@@ -1,0 +1,71 @@
+# MQTT 3.1.1 protocol constants
+
+use std.types.string.str;
+
+# control packet types, encoded in the high nibble of the fixed header byte
+pub val CONNECT:     u8 = 1;
+pub val CONNACK:     u8 = 2;
+pub val PUBLISH:     u8 = 3;
+pub val PUBACK:      u8 = 4;
+pub val PUBREC:      u8 = 5;
+pub val PUBREL:      u8 = 6;
+pub val PUBCOMP:     u8 = 7;
+pub val SUBSCRIBE:   u8 = 8;
+pub val SUBACK:      u8 = 9;
+pub val UNSUBSCRIBE: u8 = 10;
+pub val UNSUBACK:    u8 = 11;
+pub val PINGREQ:     u8 = 12;
+pub val PINGRESP:    u8 = 13;
+pub val DISCONNECT:  u8 = 14;
+
+# quality of service levels (QoS 2 is out of scope for this subset)
+pub val QOS0: u8 = 0;
+pub val QOS1: u8 = 1;
+pub val QOS2: u8 = 2;
+
+# protocol name and level for MQTT 3.1.1
+pub val PROTOCOL_NAME:  str = "MQTT";
+pub val PROTOCOL_LEVEL: u8  = 4;
+
+# CONNECT variable-header flag bit masks
+pub val CF_USERNAME:     u8 = 128;
+pub val CF_PASSWORD:     u8 = 64;
+pub val CF_WILL_RETAIN:  u8 = 32;
+pub val CF_WILL_QOS:     u8 = 24;
+pub val CF_WILL_FLAG:    u8 = 4;
+pub val CF_CLEAN_SESSION: u8 = 2;
+
+# CONNACK return codes
+pub val CONNACK_ACCEPTED:            u8 = 0;
+pub val CONNACK_UNACCEPTABLE_PROTO:  u8 = 1;
+pub val CONNACK_IDENTIFIER_REJECTED: u8 = 2;
+pub val CONNACK_SERVER_UNAVAILABLE:  u8 = 3;
+pub val CONNACK_BAD_CREDENTIALS:     u8 = 4;
+pub val CONNACK_NOT_AUTHORIZED:      u8 = 5;
+
+# SUBACK return code for a failed subscription
+pub val SUBACK_FAILURE: u8 = 128;
+
+# encode a control packet type into the high nibble of a fixed-header byte
+# ---
+# t:   control packet type
+# ret: fixed-header byte with a zero low nibble
+pub fun header_byte(t: u8) u8 {
+    ret t << 4;
+}
+
+# extract the control packet type from a fixed-header byte
+# ---
+# b:   fixed-header byte
+# ret: control packet type in the low bits
+pub fun header_type(b: u8) u8 {
+    ret b >> 4;
+}
+
+# extract the flags nibble from a fixed-header byte
+# ---
+# b:   fixed-header byte
+# ret: the low four bits
+pub fun header_flags(b: u8) u8 {
+    ret b & 15;
+}
