@@ -56,7 +56,7 @@ client.connect(?c, ip.endpoint(127, 0, 0, 1, 1883), ?opts);
 
 client.subscribe(?c, "sensors/#", 1);
 var msg: client.Message;
-client.next_message(?c, ?msg);   # blocks; msg borrows the client's decode arena
+client.next_message(?c, ?msg);   # blocks; msg valid until the next next_message
 
 client.publish(?c, "sensors/room", data, len, 1, 0);
 client.disconnect(?c);
