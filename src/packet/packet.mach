@@ -1,0 +1,799 @@
+# MQTT 3.1.1 control packet model and codec
+#
+# a single Packet value models every control packet; the active fields depend on
+# `kind`. encode serializes a Packet into a WriteBuf. decode parses a Packet from
+# a ReadBuf, allocating owned copies of every string and blob from the supplied
+# allocator (use an arena and reset it to reclaim a decoded packet in one step).
+
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_ok;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use buffer:    std.io.buffer;
+use allocator: std.allocator;
+use vector:    std.collections.vector;
+
+use types: mqtt.packet.types;
+use varint: mqtt.packet.varint;
+use field: mqtt.packet.field;
+
+# CONNECT packet contents
+# ---
+# protocol_level: protocol level byte (4 for 3.1.1)
+# clean_session:  1 to start a fresh session
+# keepalive:      keepalive interval in seconds
+# client_id:      client identifier
+# will_flag:      1 if a will message is present
+# will_qos:       will QoS level
+# will_retain:    1 if the will is retained
+# will_topic:     will topic (valid when will_flag)
+# will_payload:   will payload (valid when will_flag)
+# username_flag:  1 if a username is present
+# username:       username (valid when username_flag)
+# password_flag:  1 if a password is present
+# password:       password bytes (valid when password_flag)
+pub rec Connect {
+    protocol_level: u8;
+    clean_session:  u8;
+    keepalive:      u16;
+    client_id:      str;
+    will_flag:      u8;
+    will_qos:       u8;
+    will_retain:    u8;
+    will_topic:     str;
+    will_payload:   field.Blob;
+    username_flag:  u8;
+    username:       str;
+    password_flag:  u8;
+    password:       field.Blob;
+}
+
+# CONNACK packet contents
+# ---
+# session_present: 1 if the server resumed an existing session
+# return_code:     connection return code (0 = accepted)
+pub rec Connack {
+    session_present: u8;
+    return_code:     u8;
+}
+
+# PUBLISH packet contents
+# ---
+# topic:   topic name (no wildcards)
+# payload: application message bytes
+pub rec Publish {
+    topic:   str;
+    payload: field.Blob;
+}
+
+# one entry of a SUBSCRIBE or UNSUBSCRIBE topic list
+# ---
+# filter: topic filter (may contain + and # wildcards)
+# qos:    requested QoS (SUBSCRIBE only; ignored for UNSUBSCRIBE)
+pub rec TopicFilter {
+    filter: str;
+    qos:    u8;
+}
+
+# a decoded or to-be-encoded MQTT control packet
+# ---
+# kind:         control packet type (see mqtt.packet.types)
+# dup:          PUBLISH duplicate-delivery flag
+# qos:          PUBLISH QoS level
+# retain:       PUBLISH retain flag
+# id:           packet identifier (PUBLISH QoS>0, PUBACK, PUB*, SUB*, UNSUB*)
+# connect:      CONNECT contents (valid when kind == CONNECT)
+# connack:      CONNACK contents (valid when kind == CONNACK)
+# publish:      PUBLISH contents (valid when kind == PUBLISH)
+# filters:      SUBSCRIBE/UNSUBSCRIBE entries
+# filter_count: number of entries in filters
+# codes:        SUBACK granted-QoS/failure codes
+# code_count:   number of entries in codes
+pub rec Packet {
+    kind:   u8;
+    dup:    u8;
+    qos:    u8;
+    retain: u8;
+    id:     u16;
+
+    connect: Connect;
+    connack: Connack;
+    publish: Publish;
+
+    filters:      *TopicFilter;
+    filter_count: usize;
+    codes:        *u8;
+    code_count:   usize;
+}
+
+# create a zeroed packet of the given kind
+# ---
+# kind: control packet type
+# ret:  a packet with all fields cleared and kind set
+pub fun zero(kind: u8) Packet {
+    var p: Packet;
+    p.kind   = kind;
+    p.dup    = 0;
+    p.qos    = 0;
+    p.retain = 0;
+    p.id     = 0;
+
+    p.connect.protocol_level = types.PROTOCOL_LEVEL;
+    p.connect.clean_session  = 0;
+    p.connect.keepalive      = 0;
+    p.connect.client_id      = nil;
+    p.connect.will_flag      = 0;
+    p.connect.will_qos       = 0;
+    p.connect.will_retain    = 0;
+    p.connect.will_topic     = nil;
+    p.connect.will_payload   = field.Blob{data: nil, len: 0};
+    p.connect.username_flag  = 0;
+    p.connect.username       = nil;
+    p.connect.password_flag  = 0;
+    p.connect.password       = field.Blob{data: nil, len: 0};
+
+    p.connack.session_present = 0;
+    p.connack.return_code     = 0;
+
+    p.publish.topic   = nil;
+    p.publish.payload = field.Blob{data: nil, len: 0};
+
+    p.filters      = nil;
+    p.filter_count = 0;
+    p.codes        = nil;
+    p.code_count   = 0;
+    ret p;
+}
+
+# assemble the fixed-header first byte (type nibble plus type-specific flags)
+fun fixed_header(p: *Packet) u8 {
+    var flags: u8 = 0;
+    if (p.kind == types.PUBLISH) {
+        flags = (p.dup << 3) | (p.qos << 1) | (p.retain & 1);
+    }
+    or (p.kind == types.PUBREL || p.kind == types.SUBSCRIBE || p.kind == types.UNSUBSCRIBE) {
+        flags = 2;
+    }
+    ret types.header_byte(p.kind) | flags;
+}
+
+fun encode_connect(p: *Packet, body: *buffer.WriteBuf) Result[usize, str] {
+    val c: *Connect = ?p.connect;
+    var r: Result[usize, str];
+
+    r = field.write_string(body, types.PROTOCOL_NAME);
+    if (is_err[usize, str](r)) { ret r; }
+    r = buffer.wbuf_write[u8](body, types.PROTOCOL_LEVEL);
+    if (is_err[usize, str](r)) { ret r; }
+
+    var flags: u8 = 0;
+    if (c.clean_session != 0) { flags = flags | types.CF_CLEAN_SESSION; }
+    if (c.will_flag != 0) {
+        flags = flags | types.CF_WILL_FLAG;
+        flags = flags | ((c.will_qos & 3) << 3);
+        if (c.will_retain != 0) { flags = flags | types.CF_WILL_RETAIN; }
+    }
+    if (c.username_flag != 0) { flags = flags | types.CF_USERNAME; }
+    if (c.password_flag != 0) { flags = flags | types.CF_PASSWORD; }
+    r = buffer.wbuf_write[u8](body, flags);
+    if (is_err[usize, str](r)) { ret r; }
+
+    r = field.write_u16(body, c.keepalive);
+    if (is_err[usize, str](r)) { ret r; }
+
+    r = field.write_string(body, c.client_id);
+    if (is_err[usize, str](r)) { ret r; }
+
+    if (c.will_flag != 0) {
+        r = field.write_string(body, c.will_topic);
+        if (is_err[usize, str](r)) { ret r; }
+        r = field.write_blob(body, c.will_payload.data, c.will_payload.len);
+        if (is_err[usize, str](r)) { ret r; }
+    }
+    if (c.username_flag != 0) {
+        r = field.write_string(body, c.username);
+        if (is_err[usize, str](r)) { ret r; }
+    }
+    if (c.password_flag != 0) {
+        r = field.write_blob(body, c.password.data, c.password.len);
+        if (is_err[usize, str](r)) { ret r; }
+    }
+    ret ok[usize, str](body.len);
+}
+
+fun encode_body(p: *Packet, body: *buffer.WriteBuf) Result[usize, str] {
+    var r: Result[usize, str];
+
+    if (p.kind == types.CONNECT) {
+        ret encode_connect(p, body);
+    }
+    or (p.kind == types.CONNACK) {
+        r = buffer.wbuf_write[u8](body, p.connack.session_present & 1);
+        if (is_err[usize, str](r)) { ret r; }
+        ret buffer.wbuf_write[u8](body, p.connack.return_code);
+    }
+    or (p.kind == types.PUBLISH) {
+        r = field.write_string(body, p.publish.topic);
+        if (is_err[usize, str](r)) { ret r; }
+        if (p.qos > 0) {
+            r = field.write_u16(body, p.id);
+            if (is_err[usize, str](r)) { ret r; }
+        }
+        if (p.publish.payload.len > 0) {
+            ret buffer.wbuf_write_bytes(body, p.publish.payload.data, p.publish.payload.len);
+        }
+        ret ok[usize, str](body.len);
+    }
+    or (p.kind == types.PUBACK || p.kind == types.PUBREC || p.kind == types.PUBREL
+        || p.kind == types.PUBCOMP || p.kind == types.UNSUBACK) {
+        ret field.write_u16(body, p.id);
+    }
+    or (p.kind == types.SUBSCRIBE) {
+        r = field.write_u16(body, p.id);
+        if (is_err[usize, str](r)) { ret r; }
+        var i: usize = 0;
+        for (i < p.filter_count) {
+            r = field.write_string(body, p.filters[i].filter);
+            if (is_err[usize, str](r)) { ret r; }
+            r = buffer.wbuf_write[u8](body, p.filters[i].qos & 3);
+            if (is_err[usize, str](r)) { ret r; }
+            i = i + 1;
+        }
+        ret ok[usize, str](body.len);
+    }
+    or (p.kind == types.SUBACK) {
+        r = field.write_u16(body, p.id);
+        if (is_err[usize, str](r)) { ret r; }
+        var i: usize = 0;
+        for (i < p.code_count) {
+            r = buffer.wbuf_write[u8](body, p.codes[i]);
+            if (is_err[usize, str](r)) { ret r; }
+            i = i + 1;
+        }
+        ret ok[usize, str](body.len);
+    }
+    or (p.kind == types.UNSUBSCRIBE) {
+        r = field.write_u16(body, p.id);
+        if (is_err[usize, str](r)) { ret r; }
+        var i: usize = 0;
+        for (i < p.filter_count) {
+            r = field.write_string(body, p.filters[i].filter);
+            if (is_err[usize, str](r)) { ret r; }
+            i = i + 1;
+        }
+        ret ok[usize, str](body.len);
+    }
+    or (p.kind == types.PINGREQ || p.kind == types.PINGRESP || p.kind == types.DISCONNECT) {
+        ret ok[usize, str](0);
+    }
+    ret err[usize, str]("unknown packet kind");
+}
+
+# serialize a packet into a write buffer
+# ---
+# p:   packet to encode
+# out: destination buffer
+# ret: total bytes written, or an error
+pub fun encode(p: *Packet, out: *buffer.WriteBuf) Result[usize, str] {
+    var body: buffer.WriteBuf = buffer.wbuf_make(out.alloc);
+    val br: Result[usize, str] = encode_body(p, ?body);
+    if (is_err[usize, str](br)) { buffer.wbuf_dnit(?body); ret br; }
+
+    val start: usize = out.len;
+    var r: Result[usize, str] = buffer.wbuf_write[u8](out, fixed_header(p));
+    if (is_err[usize, str](r)) { buffer.wbuf_dnit(?body); ret r; }
+
+    r = varint.encode(out, body.len);
+    if (is_err[usize, str](r)) { buffer.wbuf_dnit(?body); ret r; }
+
+    if (body.len > 0) {
+        r = buffer.wbuf_write_bytes(out, body.data, body.len);
+        if (is_err[usize, str](r)) { buffer.wbuf_dnit(?body); ret r; }
+    }
+    buffer.wbuf_dnit(?body);
+    ret ok[usize, str](out.len - start);
+}
+
+fun decode_connect(p: *Packet, body: *buffer.ReadBuf, a: *allocator.Allocator) Result[usize, str] {
+    val pn: Result[str, str] = field.read_string(body, a);
+    if (is_err[str, str](pn)) { ret err[usize, str]("connect: bad protocol name"); }
+    if (!str_equals(unwrap_ok[str, str](pn), types.PROTOCOL_NAME)) {
+        ret err[usize, str]("connect: unsupported protocol name");
+    }
+
+    val lvl: Result[u8, str] = buffer.rbuf_read[u8](body);
+    if (is_err[u8, str](lvl)) { ret err[usize, str]("connect: truncated level"); }
+    p.connect.protocol_level = unwrap_ok[u8, str](lvl);
+
+    val flr: Result[u8, str] = buffer.rbuf_read[u8](body);
+    if (is_err[u8, str](flr)) { ret err[usize, str]("connect: truncated flags"); }
+    val flags: u8 = unwrap_ok[u8, str](flr);
+
+    p.connect.clean_session = (flags & types.CF_CLEAN_SESSION) != 0;
+    p.connect.will_flag     = (flags & types.CF_WILL_FLAG) != 0;
+    p.connect.will_qos      = (flags >> 3) & 3;
+    p.connect.will_retain   = (flags & types.CF_WILL_RETAIN) != 0;
+    p.connect.username_flag = (flags & types.CF_USERNAME) != 0;
+    p.connect.password_flag = (flags & types.CF_PASSWORD) != 0;
+
+    val ka: Result[u16, str] = field.read_u16(body);
+    if (is_err[u16, str](ka)) { ret err[usize, str]("connect: truncated keepalive"); }
+    p.connect.keepalive = unwrap_ok[u16, str](ka);
+
+    val cid: Result[str, str] = field.read_string(body, a);
+    if (is_err[str, str](cid)) { ret err[usize, str]("connect: truncated client id"); }
+    p.connect.client_id = unwrap_ok[str, str](cid);
+
+    if (p.connect.will_flag != 0) {
+        val wt: Result[str, str] = field.read_string(body, a);
+        if (is_err[str, str](wt)) { ret err[usize, str]("connect: truncated will topic"); }
+        p.connect.will_topic = unwrap_ok[str, str](wt);
+
+        val wp: Result[field.Blob, str] = field.read_blob(body, a);
+        if (is_err[field.Blob, str](wp)) { ret err[usize, str]("connect: truncated will payload"); }
+        p.connect.will_payload = unwrap_ok[field.Blob, str](wp);
+    }
+    if (p.connect.username_flag != 0) {
+        val un: Result[str, str] = field.read_string(body, a);
+        if (is_err[str, str](un)) { ret err[usize, str]("connect: truncated username"); }
+        p.connect.username = unwrap_ok[str, str](un);
+    }
+    if (p.connect.password_flag != 0) {
+        val pw: Result[field.Blob, str] = field.read_blob(body, a);
+        if (is_err[field.Blob, str](pw)) { ret err[usize, str]("connect: truncated password"); }
+        p.connect.password = unwrap_ok[field.Blob, str](pw);
+    }
+    ret ok[usize, str](0);
+}
+
+fun decode_publish(p: *Packet, flags: u8, body: *buffer.ReadBuf, a: *allocator.Allocator) Result[usize, str] {
+    p.dup    = (flags >> 3) & 1;
+    p.qos    = (flags >> 1) & 3;
+    p.retain = flags & 1;
+    if (p.qos > 2) { ret err[usize, str]("publish: invalid qos"); }
+
+    val tp: Result[str, str] = field.read_string(body, a);
+    if (is_err[str, str](tp)) { ret err[usize, str]("publish: truncated topic"); }
+    p.publish.topic = unwrap_ok[str, str](tp);
+
+    if (p.qos > 0) {
+        val id: Result[u16, str] = field.read_u16(body);
+        if (is_err[u16, str](id)) { ret err[usize, str]("publish: truncated id"); }
+        p.id = unwrap_ok[u16, str](id);
+    }
+
+    val rem: usize = buffer.rbuf_remaining(body);
+    if (rem == 0) {
+        p.publish.payload = field.Blob{data: nil, len: 0};
+        ret ok[usize, str](0);
+    }
+    val pr: Result[*u8, str] = buffer.rbuf_read_bytes(body, rem);
+    if (is_err[*u8, str](pr)) { ret err[usize, str]("publish: truncated payload"); }
+    val ob: Result[field.Blob, str] = field.own_bytes(unwrap_ok[*u8, str](pr), rem, a);
+    if (is_err[field.Blob, str](ob)) { ret err[usize, str]("publish: payload alloc"); }
+    p.publish.payload = unwrap_ok[field.Blob, str](ob);
+    ret ok[usize, str](0);
+}
+
+fun decode_topic_list(p: *Packet, body: *buffer.ReadBuf, a: *allocator.Allocator, with_qos: u8) Result[usize, str] {
+    var list: vector.Vector[TopicFilter] = vector.init[TopicFilter](a);
+    for (buffer.rbuf_remaining(body) > 0) {
+        val fr: Result[str, str] = field.read_string(body, a);
+        if (is_err[str, str](fr)) { ret err[usize, str]("topic list: truncated filter"); }
+        var tf: TopicFilter;
+        tf.filter = unwrap_ok[str, str](fr);
+        tf.qos = 0;
+        if (with_qos != 0) {
+            val qr: Result[u8, str] = buffer.rbuf_read[u8](body);
+            if (is_err[u8, str](qr)) { ret err[usize, str]("topic list: truncated qos"); }
+            tf.qos = unwrap_ok[u8, str](qr) & 3;
+        }
+        if (is_err[usize, str](vector.push[TopicFilter](?list, tf))) {
+            ret err[usize, str]("topic list: alloc");
+        }
+    }
+    p.filters = list.data;
+    p.filter_count = list.len;
+    ret ok[usize, str](0);
+}
+
+# expected fixed-header flag nibble for a non-PUBLISH packet type (MQTT-2.2.2-1/2)
+fun expected_flags(kind: u8) u8 {
+    if (kind == types.PUBREL || kind == types.SUBSCRIBE || kind == types.UNSUBSCRIBE) { ret 2; }
+    ret 0;
+}
+
+# parse a packet body given its already-read fixed-header byte
+# ---
+# header: fixed-header first byte
+# body:   buffer positioned at the start of the variable header
+# a:      allocator for owned strings and blobs
+# ret:    the parsed packet, or an error
+pub fun decode_body(header: u8, body: *buffer.ReadBuf, a: *allocator.Allocator) Result[Packet, str] {
+    val kind: u8 = types.header_type(header);
+    val flags: u8 = types.header_flags(header);
+
+    # PUBLISH carries dup/qos/retain in its flags; every other type has reserved
+    # bits that MUST match a fixed value or the packet is malformed
+    if (kind != types.PUBLISH && flags != expected_flags(kind)) {
+        ret err[Packet, str]("malformed fixed header flags");
+    }
+
+    var p: Packet = zero(kind);
+
+    if (kind == types.CONNECT) {
+        val r: Result[usize, str] = decode_connect(?p, body, a);
+        if (is_err[usize, str](r)) { ret err[Packet, str](unwrap_err[usize, str](r)); }
+    }
+    or (kind == types.CONNACK) {
+        val f: Result[u8, str] = buffer.rbuf_read[u8](body);
+        if (is_err[u8, str](f)) { ret err[Packet, str]("connack: truncated flags"); }
+        p.connack.session_present = unwrap_ok[u8, str](f) & 1;
+        val rc: Result[u8, str] = buffer.rbuf_read[u8](body);
+        if (is_err[u8, str](rc)) { ret err[Packet, str]("connack: truncated code"); }
+        p.connack.return_code = unwrap_ok[u8, str](rc);
+    }
+    or (kind == types.PUBLISH) {
+        val r: Result[usize, str] = decode_publish(?p, flags, body, a);
+        if (is_err[usize, str](r)) { ret err[Packet, str](unwrap_err[usize, str](r)); }
+    }
+    or (kind == types.PUBACK || kind == types.PUBREC || kind == types.PUBREL
+        || kind == types.PUBCOMP || kind == types.UNSUBACK) {
+        val id: Result[u16, str] = field.read_u16(body);
+        if (is_err[u16, str](id)) { ret err[Packet, str]("ack: truncated id"); }
+        p.id = unwrap_ok[u16, str](id);
+    }
+    or (kind == types.SUBSCRIBE) {
+        val id: Result[u16, str] = field.read_u16(body);
+        if (is_err[u16, str](id)) { ret err[Packet, str]("subscribe: truncated id"); }
+        p.id = unwrap_ok[u16, str](id);
+        val r: Result[usize, str] = decode_topic_list(?p, body, a, 1);
+        if (is_err[usize, str](r)) { ret err[Packet, str](unwrap_err[usize, str](r)); }
+    }
+    or (kind == types.UNSUBSCRIBE) {
+        val id: Result[u16, str] = field.read_u16(body);
+        if (is_err[u16, str](id)) { ret err[Packet, str]("unsubscribe: truncated id"); }
+        p.id = unwrap_ok[u16, str](id);
+        val r: Result[usize, str] = decode_topic_list(?p, body, a, 0);
+        if (is_err[usize, str](r)) { ret err[Packet, str](unwrap_err[usize, str](r)); }
+    }
+    or (kind == types.SUBACK) {
+        val id: Result[u16, str] = field.read_u16(body);
+        if (is_err[u16, str](id)) { ret err[Packet, str]("suback: truncated id"); }
+        p.id = unwrap_ok[u16, str](id);
+        var list: vector.Vector[u8] = vector.init[u8](a);
+        for (buffer.rbuf_remaining(body) > 0) {
+            val c: Result[u8, str] = buffer.rbuf_read[u8](body);
+            if (is_err[u8, str](c)) { ret err[Packet, str]("suback: truncated code"); }
+            if (is_err[usize, str](vector.push[u8](?list, unwrap_ok[u8, str](c)))) {
+                ret err[Packet, str]("suback: alloc");
+            }
+        }
+        p.codes = list.data;
+        p.code_count = list.len;
+    }
+    or (kind == types.PINGREQ || kind == types.PINGRESP || kind == types.DISCONNECT) {
+        # no body
+    }
+    or {
+        ret err[Packet, str]("unknown packet kind");
+    }
+    ret ok[Packet, str](p);
+}
+
+# parse a whole packet (fixed header, remaining length, body) from a buffer
+# ---
+# rb: buffer positioned at the fixed-header byte
+# a:  allocator for owned strings and blobs
+# ret: the parsed packet, or an error
+pub fun decode(rb: *buffer.ReadBuf, a: *allocator.Allocator) Result[Packet, str] {
+    val hb: Result[u8, str] = buffer.rbuf_read[u8](rb);
+    if (is_err[u8, str](hb)) { ret err[Packet, str]("truncated fixed header"); }
+
+    val rl: Result[usize, str] = varint.decode(rb);
+    if (is_err[usize, str](rl)) { ret err[Packet, str](unwrap_err[usize, str](rl)); }
+    val len: usize = unwrap_ok[usize, str](rl);
+
+    val bp: Result[*u8, str] = buffer.rbuf_read_bytes(rb, len);
+    if (is_err[*u8, str](bp)) { ret err[Packet, str]("truncated packet body"); }
+
+    var body: buffer.ReadBuf = buffer.rbuf_make(unwrap_ok[*u8, str](bp), len);
+    ret decode_body(unwrap_ok[u8, str](hb), ?body, a);
+}
+
+use page: std.allocator.page;
+use mem_test: std.memory;
+
+fun blob_eq(b: field.Blob, expect: *u8, len: usize) u8 {
+    if (b.len != len) { ret 0; }
+    if (len == 0) { ret 1; }
+    if (mem_test.raw_equal(b.data::ptr, expect::ptr, len)) { ret 1; }
+    ret 0;
+}
+
+test "codec: connect full round-trip" {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var wb: buffer.WriteBuf = buffer.wbuf_make(?a);
+
+    var p: Packet = zero(types.CONNECT);
+    p.connect.clean_session = 1;
+    p.connect.keepalive = 60;
+    p.connect.client_id = "sensor-1";
+    p.connect.will_flag = 1;
+    p.connect.will_qos = 1;
+    p.connect.will_retain = 1;
+    p.connect.will_topic = "dev/status";
+    var wpay: [4]u8 = [4]u8{'d', 'e', 'a', 'd'};
+    p.connect.will_payload = field.Blob{data: ?wpay[0], len: 4};
+    p.connect.username_flag = 1;
+    p.connect.username = "admin";
+    p.connect.password_flag = 1;
+    var pw: [3]u8 = [3]u8{'p', 'w', '0'};
+    p.connect.password = field.Blob{data: ?pw[0], len: 3};
+
+    if (is_err[usize, str](encode(?p, ?wb))) { ret 1; }
+
+    var rb: buffer.ReadBuf = buffer.rbuf_make(wb.data, wb.len);
+    val dr: Result[Packet, str] = decode(?rb, ?a);
+    if (is_err[Packet, str](dr)) { ret 1; }
+    val d: Packet = unwrap_ok[Packet, str](dr);
+
+    if (d.kind != types.CONNECT) { ret 1; }
+    if (d.connect.clean_session != 1) { ret 1; }
+    if (d.connect.keepalive != 60) { ret 1; }
+    if (!str_equals(d.connect.client_id, "sensor-1")) { ret 1; }
+    if (d.connect.will_flag != 1) { ret 1; }
+    if (d.connect.will_qos != 1) { ret 1; }
+    if (d.connect.will_retain != 1) { ret 1; }
+    if (!str_equals(d.connect.will_topic, "dev/status")) { ret 1; }
+    if (blob_eq(d.connect.will_payload, ?wpay[0], 4) == 0) { ret 1; }
+    if (d.connect.username_flag != 1) { ret 1; }
+    if (!str_equals(d.connect.username, "admin")) { ret 1; }
+    if (d.connect.password_flag != 1) { ret 1; }
+    if (blob_eq(d.connect.password, ?pw[0], 3) == 0) { ret 1; }
+    ret 0;
+}
+
+test "codec: connect minimal round-trip" {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var wb: buffer.WriteBuf = buffer.wbuf_make(?a);
+
+    var p: Packet = zero(types.CONNECT);
+    p.connect.clean_session = 1;
+    p.connect.keepalive = 15;
+    p.connect.client_id = "c";
+    if (is_err[usize, str](encode(?p, ?wb))) { ret 1; }
+
+    var rb: buffer.ReadBuf = buffer.rbuf_make(wb.data, wb.len);
+    val dr: Result[Packet, str] = decode(?rb, ?a);
+    if (is_err[Packet, str](dr)) { ret 1; }
+    val d: Packet = unwrap_ok[Packet, str](dr);
+    if (d.connect.will_flag != 0) { ret 1; }
+    if (d.connect.username_flag != 0) { ret 1; }
+    if (d.connect.password_flag != 0) { ret 1; }
+    if (!str_equals(d.connect.client_id, "c")) { ret 1; }
+    ret 0;
+}
+
+test "codec: connack round-trip" {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var wb: buffer.WriteBuf = buffer.wbuf_make(?a);
+    var p: Packet = zero(types.CONNACK);
+    p.connack.session_present = 1;
+    p.connack.return_code = types.CONNACK_ACCEPTED;
+    if (is_err[usize, str](encode(?p, ?wb))) { ret 1; }
+    var rb: buffer.ReadBuf = buffer.rbuf_make(wb.data, wb.len);
+    val dr: Result[Packet, str] = decode(?rb, ?a);
+    if (is_err[Packet, str](dr)) { ret 1; }
+    val d: Packet = unwrap_ok[Packet, str](dr);
+    if (d.kind != types.CONNACK) { ret 1; }
+    if (d.connack.session_present != 1) { ret 1; }
+    if (d.connack.return_code != 0) { ret 1; }
+    ret 0;
+}
+
+test "codec: publish qos0 round-trip" {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var wb: buffer.WriteBuf = buffer.wbuf_make(?a);
+    var p: Packet = zero(types.PUBLISH);
+    p.qos = 0;
+    p.retain = 0;
+    p.publish.topic = "a/b/c";
+    var pay: [5]u8 = [5]u8{'h', 'e', 'l', 'l', 'o'};
+    p.publish.payload = field.Blob{data: ?pay[0], len: 5};
+    if (is_err[usize, str](encode(?p, ?wb))) { ret 1; }
+    var rb: buffer.ReadBuf = buffer.rbuf_make(wb.data, wb.len);
+    val dr: Result[Packet, str] = decode(?rb, ?a);
+    if (is_err[Packet, str](dr)) { ret 1; }
+    val d: Packet = unwrap_ok[Packet, str](dr);
+    if (d.kind != types.PUBLISH) { ret 1; }
+    if (d.qos != 0) { ret 1; }
+    if (!str_equals(d.publish.topic, "a/b/c")) { ret 1; }
+    if (blob_eq(d.publish.payload, ?pay[0], 5) == 0) { ret 1; }
+    ret 0;
+}
+
+test "codec: publish qos1 with flags round-trip" {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var wb: buffer.WriteBuf = buffer.wbuf_make(?a);
+    var p: Packet = zero(types.PUBLISH);
+    p.qos = 1;
+    p.dup = 1;
+    p.retain = 1;
+    p.id = 4242;
+    p.publish.topic = "t";
+    var pay: [1]u8 = [1]u8{'x'};
+    p.publish.payload = field.Blob{data: ?pay[0], len: 1};
+    if (is_err[usize, str](encode(?p, ?wb))) { ret 1; }
+    var rb: buffer.ReadBuf = buffer.rbuf_make(wb.data, wb.len);
+    val dr: Result[Packet, str] = decode(?rb, ?a);
+    if (is_err[Packet, str](dr)) { ret 1; }
+    val d: Packet = unwrap_ok[Packet, str](dr);
+    if (d.qos != 1) { ret 1; }
+    if (d.dup != 1) { ret 1; }
+    if (d.retain != 1) { ret 1; }
+    if (d.id != 4242) { ret 1; }
+    if (!str_equals(d.publish.topic, "t")) { ret 1; }
+    ret 0;
+}
+
+test "codec: publish empty payload round-trip" {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var wb: buffer.WriteBuf = buffer.wbuf_make(?a);
+    var p: Packet = zero(types.PUBLISH);
+    p.publish.topic = "empty";
+    if (is_err[usize, str](encode(?p, ?wb))) { ret 1; }
+    var rb: buffer.ReadBuf = buffer.rbuf_make(wb.data, wb.len);
+    val dr: Result[Packet, str] = decode(?rb, ?a);
+    if (is_err[Packet, str](dr)) { ret 1; }
+    val d: Packet = unwrap_ok[Packet, str](dr);
+    if (d.publish.payload.len != 0) { ret 1; }
+    ret 0;
+}
+
+fun ack_roundtrip(kind: u8) u8 {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var wb: buffer.WriteBuf = buffer.wbuf_make(?a);
+    var p: Packet = zero(kind);
+    p.id = 999;
+    if (is_err[usize, str](encode(?p, ?wb))) { ret 1; }
+    var rb: buffer.ReadBuf = buffer.rbuf_make(wb.data, wb.len);
+    val dr: Result[Packet, str] = decode(?rb, ?a);
+    if (is_err[Packet, str](dr)) { ret 1; }
+    val d: Packet = unwrap_ok[Packet, str](dr);
+    if (d.kind != kind) { ret 1; }
+    if (d.id != 999) { ret 1; }
+    ret 0;
+}
+
+test "codec: puback round-trip" { if (ack_roundtrip(types.PUBACK) != 0) { ret 1; } ret 0; }
+test "codec: pubrec round-trip" { if (ack_roundtrip(types.PUBREC) != 0) { ret 1; } ret 0; }
+test "codec: pubrel round-trip" { if (ack_roundtrip(types.PUBREL) != 0) { ret 1; } ret 0; }
+test "codec: pubcomp round-trip" { if (ack_roundtrip(types.PUBCOMP) != 0) { ret 1; } ret 0; }
+test "codec: unsuback round-trip" { if (ack_roundtrip(types.UNSUBACK) != 0) { ret 1; } ret 0; }
+
+test "codec: subscribe multi-filter round-trip" {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var wb: buffer.WriteBuf = buffer.wbuf_make(?a);
+    var p: Packet = zero(types.SUBSCRIBE);
+    p.id = 10;
+    var filters: [3]TopicFilter;
+    filters[0] = TopicFilter{filter: "a/+/c", qos: 0};
+    filters[1] = TopicFilter{filter: "x/#", qos: 1};
+    filters[2] = TopicFilter{filter: "solo", qos: 2};
+    p.filters = ?filters[0];
+    p.filter_count = 3;
+    if (is_err[usize, str](encode(?p, ?wb))) { ret 1; }
+    var rb: buffer.ReadBuf = buffer.rbuf_make(wb.data, wb.len);
+    val dr: Result[Packet, str] = decode(?rb, ?a);
+    if (is_err[Packet, str](dr)) { ret 1; }
+    val d: Packet = unwrap_ok[Packet, str](dr);
+    if (d.kind != types.SUBSCRIBE) { ret 1; }
+    if (d.id != 10) { ret 1; }
+    if (d.filter_count != 3) { ret 1; }
+    if (!str_equals(d.filters[0].filter, "a/+/c")) { ret 1; }
+    if (d.filters[0].qos != 0) { ret 1; }
+    if (!str_equals(d.filters[1].filter, "x/#")) { ret 1; }
+    if (d.filters[1].qos != 1) { ret 1; }
+    if (!str_equals(d.filters[2].filter, "solo")) { ret 1; }
+    if (d.filters[2].qos != 2) { ret 1; }
+    ret 0;
+}
+
+test "codec: suback multi-code round-trip" {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var wb: buffer.WriteBuf = buffer.wbuf_make(?a);
+    var p: Packet = zero(types.SUBACK);
+    p.id = 11;
+    var codes: [3]u8 = [3]u8{0, 1, types.SUBACK_FAILURE};
+    p.codes = ?codes[0];
+    p.code_count = 3;
+    if (is_err[usize, str](encode(?p, ?wb))) { ret 1; }
+    var rb: buffer.ReadBuf = buffer.rbuf_make(wb.data, wb.len);
+    val dr: Result[Packet, str] = decode(?rb, ?a);
+    if (is_err[Packet, str](dr)) { ret 1; }
+    val d: Packet = unwrap_ok[Packet, str](dr);
+    if (d.kind != types.SUBACK) { ret 1; }
+    if (d.id != 11) { ret 1; }
+    if (d.code_count != 3) { ret 1; }
+    if (d.codes[0] != 0) { ret 1; }
+    if (d.codes[1] != 1) { ret 1; }
+    if (d.codes[2] != types.SUBACK_FAILURE) { ret 1; }
+    ret 0;
+}
+
+test "codec: unsubscribe multi-filter round-trip" {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var wb: buffer.WriteBuf = buffer.wbuf_make(?a);
+    var p: Packet = zero(types.UNSUBSCRIBE);
+    p.id = 12;
+    var filters: [2]TopicFilter;
+    filters[0] = TopicFilter{filter: "a/b", qos: 0};
+    filters[1] = TopicFilter{filter: "c/#", qos: 0};
+    p.filters = ?filters[0];
+    p.filter_count = 2;
+    if (is_err[usize, str](encode(?p, ?wb))) { ret 1; }
+    var rb: buffer.ReadBuf = buffer.rbuf_make(wb.data, wb.len);
+    val dr: Result[Packet, str] = decode(?rb, ?a);
+    if (is_err[Packet, str](dr)) { ret 1; }
+    val d: Packet = unwrap_ok[Packet, str](dr);
+    if (d.kind != types.UNSUBSCRIBE) { ret 1; }
+    if (d.id != 12) { ret 1; }
+    if (d.filter_count != 2) { ret 1; }
+    if (!str_equals(d.filters[0].filter, "a/b")) { ret 1; }
+    if (!str_equals(d.filters[1].filter, "c/#")) { ret 1; }
+    ret 0;
+}
+
+fun empty_roundtrip(kind: u8) u8 {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var wb: buffer.WriteBuf = buffer.wbuf_make(?a);
+    var p: Packet = zero(kind);
+    if (is_err[usize, str](encode(?p, ?wb))) { ret 1; }
+    if (wb.len != 2) { ret 1; }
+    var rb: buffer.ReadBuf = buffer.rbuf_make(wb.data, wb.len);
+    val dr: Result[Packet, str] = decode(?rb, ?a);
+    if (is_err[Packet, str](dr)) { ret 1; }
+    if (unwrap_ok[Packet, str](dr).kind != kind) { ret 1; }
+    ret 0;
+}
+
+test "codec: rejects reserved fixed-header flags" {
+    var a: allocator.Allocator;
+    page.make(?a);
+    # SUBSCRIBE (kind 8) with flags 0000 instead of the required 0010
+    var sub_bad: [2]u8 = [2]u8{0x80, 0x00};
+    var rb1: buffer.ReadBuf = buffer.rbuf_make(?sub_bad[0], 2);
+    if (is_ok[Packet, str](decode(?rb1, ?a))) { ret 1; }
+    # PUBACK (kind 4) with flags 1111 instead of the required 0000
+    var ack_bad: [4]u8 = [4]u8{0x4F, 0x02, 0x00, 0x01};
+    var rb2: buffer.ReadBuf = buffer.rbuf_make(?ack_bad[0], 4);
+    if (is_ok[Packet, str](decode(?rb2, ?a))) { ret 1; }
+    # PUBREL (kind 6) with the correct flags 0010 still decodes
+    var rel_ok: [4]u8 = [4]u8{0x62, 0x02, 0x00, 0x01};
+    var rb3: buffer.ReadBuf = buffer.rbuf_make(?rel_ok[0], 4);
+    if (is_err[Packet, str](decode(?rb3, ?a))) { ret 1; }
+    ret 0;
+}
+
+test "codec: pingreq round-trip" { if (empty_roundtrip(types.PINGREQ) != 0) { ret 1; } ret 0; }
+test "codec: pingresp round-trip" { if (empty_roundtrip(types.PINGRESP) != 0) { ret 1; } ret 0; }
+test "codec: disconnect round-trip" { if (empty_roundtrip(types.DISCONNECT) != 0) { ret 1; } ret 0; }

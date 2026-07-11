@@ -1,0 +1,146 @@
+# MQTT remaining-length variable-byte integer
+
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_ok;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+use std.types.size.usize;
+use std.types.string.str;
+
+use buffer:    std.io.buffer;
+use allocator: std.allocator;
+use page:      std.allocator.page;
+
+# largest value representable in a four-byte remaining length
+pub val MAX_REMAINING_LENGTH: usize = 268435455;
+
+# number of bytes required to encode a remaining length
+# ---
+# value: the length to measure
+# ret:   1 to 4, or an error if the value exceeds the four-byte maximum
+pub fun encoded_size(value: usize) Result[usize, str] {
+    if (value > MAX_REMAINING_LENGTH) { ret err[usize, str]("remaining length too large"); }
+    if (value < 128) { ret ok[usize, str](1); }
+    if (value < 16384) { ret ok[usize, str](2); }
+    if (value < 2097152) { ret ok[usize, str](3); }
+    ret ok[usize, str](4);
+}
+
+# encode a remaining length into a write buffer
+# ---
+# buf:   destination buffer
+# value: length to encode (0 to MAX_REMAINING_LENGTH)
+# ret:   number of bytes written, or an error
+pub fun encode(buf: *buffer.WriteBuf, value: usize) Result[usize, str] {
+    if (value > MAX_REMAINING_LENGTH) { ret err[usize, str]("remaining length too large"); }
+
+    var n: usize = value;
+    var written: usize = 0;
+    for {
+        var byte: u8 = (n % 128)::u8;
+        n = n / 128;
+        if (n > 0) { byte = byte | 128; }
+
+        val r: Result[usize, str] = buffer.wbuf_write[u8](buf, byte);
+        if (is_err[usize, str](r)) { ret err[usize, str](unwrap_err[usize, str](r)); }
+
+        written = written + 1;
+        if (n == 0) { brk; }
+    }
+    ret ok[usize, str](written);
+}
+
+# decode a remaining length from a read buffer
+# ---
+# buf: source buffer positioned at the length field
+# ret: the decoded length, or an error on malformed input
+pub fun decode(buf: *buffer.ReadBuf) Result[usize, str] {
+    var value: usize = 0;
+    var mult:  usize = 1;
+    var count: usize = 0;
+
+    for {
+        val r: Result[u8, str] = buffer.rbuf_read[u8](buf);
+        if (is_err[u8, str](r)) { ret err[usize, str]("truncated remaining length"); }
+
+        val byte: u8 = unwrap_ok[u8, str](r);
+        value = value + (byte & 127)::usize * mult;
+        count = count + 1;
+
+        if ((byte & 128) == 0) { brk; }
+
+        if (count >= 4) { ret err[usize, str]("malformed remaining length"); }
+        mult = mult * 128;
+    }
+    ret ok[usize, str](value);
+}
+
+fun roundtrip(value: usize) u8 {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var wb: buffer.WriteBuf = buffer.wbuf_make(?a);
+
+    if (is_err[usize, str](encode(?wb, value))) { buffer.wbuf_dnit(?wb); ret 1; }
+
+    var rb: buffer.ReadBuf = buffer.rbuf_make(wb.data, wb.len);
+    val r: Result[usize, str] = decode(?rb);
+    buffer.wbuf_dnit(?wb);
+
+    if (is_err[usize, str](r)) { ret 1; }
+    if (unwrap_ok[usize, str](r) != value) { ret 1; }
+    ret 0;
+}
+
+test "varint: encoded_size boundaries" {
+    if (unwrap_ok[usize, str](encoded_size(0)) != 1) { ret 1; }
+    if (unwrap_ok[usize, str](encoded_size(127)) != 1) { ret 1; }
+    if (unwrap_ok[usize, str](encoded_size(128)) != 2) { ret 1; }
+    if (unwrap_ok[usize, str](encoded_size(16383)) != 2) { ret 1; }
+    if (unwrap_ok[usize, str](encoded_size(16384)) != 3) { ret 1; }
+    if (unwrap_ok[usize, str](encoded_size(2097151)) != 3) { ret 1; }
+    if (unwrap_ok[usize, str](encoded_size(2097152)) != 4) { ret 1; }
+    if (unwrap_ok[usize, str](encoded_size(MAX_REMAINING_LENGTH)) != 4) { ret 1; }
+    if (is_ok[usize, str](encoded_size(MAX_REMAINING_LENGTH + 1))) { ret 1; }
+    ret 0;
+}
+
+test "varint: round-trip representative values" {
+    if (roundtrip(0) != 0) { ret 1; }
+    if (roundtrip(127) != 0) { ret 1; }
+    if (roundtrip(128) != 0) { ret 1; }
+    if (roundtrip(16383) != 0) { ret 1; }
+    if (roundtrip(16384) != 0) { ret 1; }
+    if (roundtrip(2097151) != 0) { ret 1; }
+    if (roundtrip(2097152) != 0) { ret 1; }
+    if (roundtrip(MAX_REMAINING_LENGTH) != 0) { ret 1; }
+    ret 0;
+}
+
+test "varint: encode rejects oversized value" {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var wb: buffer.WriteBuf = buffer.wbuf_make(?a);
+    val r: Result[usize, str] = encode(?wb, MAX_REMAINING_LENGTH + 1);
+    buffer.wbuf_dnit(?wb);
+    if (is_ok[usize, str](r)) { ret 1; }
+    ret 0;
+}
+
+test "varint: decode rejects five continuation bytes" {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var wb: buffer.WriteBuf = buffer.wbuf_make(?a);
+    buffer.wbuf_write[u8](?wb, 255);
+    buffer.wbuf_write[u8](?wb, 255);
+    buffer.wbuf_write[u8](?wb, 255);
+    buffer.wbuf_write[u8](?wb, 255);
+    buffer.wbuf_write[u8](?wb, 127);
+    var rb: buffer.ReadBuf = buffer.rbuf_make(wb.data, wb.len);
+    val r: Result[usize, str] = decode(?rb);
+    buffer.wbuf_dnit(?wb);
+    if (is_ok[usize, str](r)) { ret 1; }
+    ret 0;
+}

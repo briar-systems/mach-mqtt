@@ -1,0 +1,79 @@
+use std.runtime;
+
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_ok;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.string.str;
+
+use print:     std.print;
+use log:       std.log;
+use parse:     std.text.parse;
+use allocator: std.allocator;
+use page:      std.allocator.page;
+use ip:        std.net.ip;
+use tcp:       std.net.tcp;
+
+use core:  mqtt.broker.core;
+use serve: mqtt.broker.serve;
+
+val DEFAULT_PORT: u16 = 1883;
+
+# parse and range-check a decimal listen port argument
+# ---
+# arg: the argument string
+# ret: the port (0-65535), or an error on non-numeric or out-of-range input
+fun parse_port(arg: str) Result[u16, str] {
+    val pr: Result[u64, str] = parse.parse_u64_exact(arg, 10);
+    if (is_err[u64, str](pr)) { ret err[u16, str]("port is not a number"); }
+    val v: u64 = unwrap_ok[u64, str](pr);
+    if (v > 65535) { ret err[u16, str]("port out of range"); }
+    ret ok[u16, str](v::u16);
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var port: u16 = DEFAULT_PORT;
+    if (argc > 1) {
+        val ppr: Result[u16, str] = parse_port(argv[1]::str);
+        if (is_err[u16, str](ppr)) {
+            print.eprintln("usage: brokerd [port]  (port must be 0-65535)");
+            ret 1;
+        }
+        port = unwrap_ok[u16, str](ppr);
+    }
+
+    log.set_level(log.INFO);
+
+    var heap: allocator.Allocator;
+    page.make(?heap);
+
+    var b: core.Broker;
+    core.init(?b, ?heap);
+
+    val ep: ip.Endpoint = ip.endpoint(0, 0, 0, 0, port);
+    val lr: Result[tcp.Listener, str] = tcp.listen(ep, 128);
+    if (is_err[tcp.Listener, str](lr)) {
+        log.error("brokerd: bind failed");
+        ret 1;
+    }
+    var ln: tcp.Listener = unwrap_ok[tcp.Listener, str](lr);
+
+    print.printlnf("brokerd: listening on 0.0.0.0:{}", port::u64);
+    serve.serve(?b, ?ln);
+
+    tcp.listener_close(?ln);
+    ret 0;
+}
+
+test "brokerd: parse_port range and format" {
+    if (unwrap_ok[u16, str](parse_port("1883")) != 1883) { ret 1; }
+    if (unwrap_ok[u16, str](parse_port("0")) != 0) { ret 1; }
+    if (unwrap_ok[u16, str](parse_port("65535")) != 65535) { ret 1; }
+    if (is_ok[u16, str](parse_port("65536"))) { ret 1; }
+    if (is_ok[u16, str](parse_port("70000"))) { ret 1; }
+    if (is_ok[u16, str](parse_port("abc"))) { ret 1; }
+    ret 0;
+}

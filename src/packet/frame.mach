@@ -1,0 +1,286 @@
+# framed packet I/O over a byte stream
+#
+# reads and writes whole MQTT control packets across a TCP connection. a frame is
+# the fixed-header byte, the remaining-length varint, and exactly that many body
+# bytes. read_packet streams the header and length byte-by-byte, then reads the
+# body into an allocation from the supplied allocator.
+
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use reader:    std.io.reader;
+use writer:    std.io.writer;
+use buffer:    std.io.buffer;
+use allocator: std.allocator;
+use page:      std.allocator.page;
+use tcp:       std.net.tcp;
+
+use packet: mqtt.packet.packet;
+use types:  mqtt.packet.types;
+use field:  mqtt.packet.field;
+
+# error returned when the peer closed the connection
+pub val ERR_EOF: str = "eof";
+
+# largest whole packet accepted from the wire (v0.1 default: 1 MiB)
+#
+# read_packet rejects any frame whose remaining length exceeds this before
+# allocating the body, so an unauthenticated peer cannot force a large
+# allocation from an attacker-controlled length.
+pub val MAX_PACKET_SIZE: usize = 1048576;
+
+fun stream_read_cb(ctx: ptr, buf: *u8, len: usize) Result[usize, str] {
+    val s: *tcp.Stream = ctx::*tcp.Stream;
+    val n: i64 = tcp.stream_read(s, buf, len);
+    if (n < 0) { ret err[usize, str]("stream read error"); }
+    ret ok[usize, str](n::usize);
+}
+
+fun stream_write_cb(ctx: ptr, buf: *u8, len: usize) Result[usize, str] {
+    val s: *tcp.Stream = ctx::*tcp.Stream;
+    val n: i64 = tcp.stream_write(s, buf, len);
+    if (n < 0) { ret err[usize, str]("stream write error"); }
+    ret ok[usize, str](n::usize);
+}
+
+# build a Reader over a TCP stream
+# ---
+# s:   the stream to read from
+# ret: a Reader that pulls bytes from the stream
+pub fun stream_reader(s: *tcp.Stream) reader.Reader {
+    var r: reader.Reader;
+    r.ctx = s::ptr;
+    r.fn_read = stream_read_cb;
+    ret r;
+}
+
+# build a Writer over a TCP stream
+# ---
+# s:   the stream to write to
+# ret: a Writer that pushes bytes to the stream
+pub fun stream_writer(s: *tcp.Stream) writer.Writer {
+    var w: writer.Writer;
+    w.ctx = s::ptr;
+    w.fn_write = stream_write_cb;
+    ret w;
+}
+
+fun read_byte(r: *reader.Reader) Result[u8, str] {
+    var b: u8 = 0;
+    val rr: Result[usize, str] = reader.read_exact(r, ?b, 1);
+    if (is_err[usize, str](rr)) {
+        val e: str = unwrap_err[usize, str](rr);
+        if (str_equals(e, reader.ERR_EOF)) { ret err[u8, str](ERR_EOF); }
+        ret err[u8, str](e);
+    }
+    ret ok[u8, str](b);
+}
+
+# read one whole packet from a reader
+#
+# returns ERR_EOF when the peer closes the connection cleanly between packets.
+# ---
+# r: reader to pull bytes from
+# a: allocator for the packet body and its owned fields
+# ret: the parsed packet, or an error
+pub fun read_packet(r: *reader.Reader, a: *allocator.Allocator) Result[packet.Packet, str] {
+    val hb: Result[u8, str] = read_byte(r);
+    if (is_err[u8, str](hb)) { ret err[packet.Packet, str](unwrap_err[u8, str](hb)); }
+    val header: u8 = unwrap_ok[u8, str](hb);
+
+    var value: usize = 0;
+    var mult:  usize = 1;
+    var count: usize = 0;
+    for {
+        val rb: Result[u8, str] = read_byte(r);
+        if (is_err[u8, str](rb)) { ret err[packet.Packet, str](unwrap_err[u8, str](rb)); }
+        val byte: u8 = unwrap_ok[u8, str](rb);
+        value = value + (byte & 127)::usize * mult;
+        count = count + 1;
+        if ((byte & 128) == 0) { brk; }
+        if (count >= 4) { ret err[packet.Packet, str]("malformed remaining length"); }
+        mult = mult * 128;
+    }
+
+    if (value > MAX_PACKET_SIZE) { ret err[packet.Packet, str]("packet exceeds maximum size"); }
+
+    if (value == 0) {
+        var empty: buffer.ReadBuf = buffer.rbuf_make(nil, 0);
+        ret packet.decode_body(header, ?empty, a);
+    }
+
+    val ar: Result[*u8, str] = allocator.allocate[u8](a, value);
+    if (is_err[*u8, str](ar)) { ret err[packet.Packet, str](unwrap_err[*u8, str](ar)); }
+    val body: *u8 = unwrap_ok[*u8, str](ar);
+
+    val rr: Result[usize, str] = reader.read_exact(r, body, value);
+    if (is_err[usize, str](rr)) {
+        val e: str = unwrap_err[usize, str](rr);
+        if (str_equals(e, reader.ERR_EOF)) { ret err[packet.Packet, str](ERR_EOF); }
+        ret err[packet.Packet, str](e);
+    }
+
+    var rbuf: buffer.ReadBuf = buffer.rbuf_make(body, value);
+    ret packet.decode_body(header, ?rbuf, a);
+}
+
+# write one whole packet to a writer
+# ---
+# w: writer to push bytes to
+# p: packet to encode and send
+# a: allocator for the encode scratch buffer
+# ret: bytes written, or an error
+pub fun write_packet(w: *writer.Writer, p: *packet.Packet, a: *allocator.Allocator) Result[usize, str] {
+    var wb: buffer.WriteBuf = buffer.wbuf_make(a);
+    val er: Result[usize, str] = packet.encode(p, ?wb);
+    if (is_err[usize, str](er)) { buffer.wbuf_dnit(?wb); ret er; }
+
+    val res: Result[usize, str] = writer.write_all(w, wb.data, wb.len);
+    buffer.wbuf_dnit(?wb);
+    ret res;
+}
+
+# read one whole packet directly from a TCP stream
+# ---
+# s: the stream to read from
+# a: allocator for the packet body and its owned fields
+# ret: the parsed packet, or an error (ERR_EOF on clean close)
+pub fun read_from(s: *tcp.Stream, a: *allocator.Allocator) Result[packet.Packet, str] {
+    var r: reader.Reader = stream_reader(s);
+    ret read_packet(?r, a);
+}
+
+# write one whole packet directly to a TCP stream
+# ---
+# s: the stream to write to
+# p: packet to encode and send
+# a: allocator for the encode scratch buffer
+# ret: bytes written, or an error
+pub fun write_to(s: *tcp.Stream, p: *packet.Packet, a: *allocator.Allocator) Result[usize, str] {
+    var w: writer.Writer = stream_writer(s);
+    ret write_packet(?w, p, a);
+}
+
+rec MemReader {
+    data: *u8;
+    len:  usize;
+    pos:  usize;
+}
+
+fun mem_read_cb(ctx: ptr, buf: *u8, len: usize) Result[usize, str] {
+    val m: *MemReader = ctx::*MemReader;
+    var n: usize = m.len - m.pos;
+    if (n > len) { n = len; }
+    if (n == 0) { ret ok[usize, str](0); }
+    var i: usize = 0;
+    for (i < n) {
+        buf[i] = m.data[m.pos + i];
+        i = i + 1;
+    }
+    m.pos = m.pos + n;
+    ret ok[usize, str](n);
+}
+
+test "frame: read_packet parses a streamed publish" {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var wb: buffer.WriteBuf = buffer.wbuf_make(?a);
+
+    var p: packet.Packet = packet.zero(types.PUBLISH);
+    p.qos = 1;
+    p.id = 7;
+    p.publish.topic = "sensors/temp";
+    var pay: [3]u8 = [3]u8{'2', '1', 'c'};
+    p.publish.payload = field.Blob{data: ?pay[0], len: 3};
+    if (is_err[usize, str](packet.encode(?p, ?wb))) { ret 1; }
+
+    var m: MemReader;
+    m.data = wb.data;
+    m.len = wb.len;
+    m.pos = 0;
+    var r: reader.Reader;
+    r.ctx = (?m)::ptr;
+    r.fn_read = mem_read_cb;
+
+    val dr: Result[packet.Packet, str] = read_packet(?r, ?a);
+    if (is_err[packet.Packet, str](dr)) { ret 1; }
+    val d: packet.Packet = unwrap_ok[packet.Packet, str](dr);
+    if (d.kind != types.PUBLISH) { ret 1; }
+    if (d.id != 7) { ret 1; }
+    if (!str_equals(d.publish.topic, "sensors/temp")) { ret 1; }
+    if (d.publish.payload.len != 3) { ret 1; }
+    ret 0;
+}
+
+test "frame: read_packet reports eof on empty stream" {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var m: MemReader;
+    m.data = nil;
+    m.len = 0;
+    m.pos = 0;
+    var r: reader.Reader;
+    r.ctx = (?m)::ptr;
+    r.fn_read = mem_read_cb;
+
+    val dr: Result[packet.Packet, str] = read_packet(?r, ?a);
+    if (is_err[packet.Packet, str](dr) == 0) { ret 1; }
+    if (!str_equals(unwrap_err[packet.Packet, str](dr), ERR_EOF)) { ret 1; }
+    ret 0;
+}
+
+test "frame: read_packet rejects an oversized remaining length" {
+    var a: allocator.Allocator;
+    page.make(?a);
+    # PUBLISH header then remaining length FF FF FF 7F (268435455, well over the cap)
+    var bytes: [5]u8 = [5]u8{0x30, 0xFF, 0xFF, 0xFF, 0x7F};
+    var m: MemReader;
+    m.data = ?bytes[0];
+    m.len = 5;
+    m.pos = 0;
+    var r: reader.Reader;
+    r.ctx = (?m)::ptr;
+    r.fn_read = mem_read_cb;
+
+    val dr: Result[packet.Packet, str] = read_packet(?r, ?a);
+    if (is_err[packet.Packet, str](dr) == 0) { ret 1; }
+    if (!str_equals(unwrap_err[packet.Packet, str](dr), "packet exceeds maximum size")) { ret 1; }
+    ret 0;
+}
+
+test "frame: read_packet parses a streamed multi-byte-length publish" {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var wb: buffer.WriteBuf = buffer.wbuf_make(?a);
+
+    var big: [300]u8;
+    var k: usize = 0;
+    for (k < 300) { big[k] = (k % 256)::u8; k = k + 1; }
+
+    var p: packet.Packet = packet.zero(types.PUBLISH);
+    p.publish.topic = "big";
+    p.publish.payload = field.Blob{data: ?big[0], len: 300};
+    if (is_err[usize, str](packet.encode(?p, ?wb))) { ret 1; }
+
+    var m: MemReader;
+    m.data = wb.data;
+    m.len = wb.len;
+    m.pos = 0;
+    var r: reader.Reader;
+    r.ctx = (?m)::ptr;
+    r.fn_read = mem_read_cb;
+
+    val dr: Result[packet.Packet, str] = read_packet(?r, ?a);
+    if (is_err[packet.Packet, str](dr)) { ret 1; }
+    val d: packet.Packet = unwrap_ok[packet.Packet, str](dr);
+    if (d.publish.payload.len != 300) { ret 1; }
+    if (d.publish.payload.data[299] != (299 % 256)::u8) { ret 1; }
+    ret 0;
+}
