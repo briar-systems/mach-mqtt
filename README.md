@@ -84,8 +84,3 @@ core.set_auth(?broker, check);
 - **Slow consumers**: the broker holds a single lock across socket writes, so a
   stalled subscriber can delay delivery to others. This is a correctness-first
   v0.1 choice, not a scalability target.
-- **Release builds of `brokerd`**: build and run `brokerd` with the default debug
-  profile. The `--profile release` (`-O2`) build of the daemon currently
-  miscompiles (a Mach codegen bug when `serve` is inlined into `main`); the
-  library itself is correct at all optimization levels (the release test suite
-  passes).
