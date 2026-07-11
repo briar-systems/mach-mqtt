@@ -6,13 +6,17 @@ MQTT 3.1.1 implemented in Mach: a protocol library (packet codec, client, broker
 
 The 3.1.1 subset that covers real-world local deployments:
 
-- QoS 0 and 1 (no QoS 2)
+- QoS 0 and 1 (QoS 2 is rejected: the broker closes such a connection and the
+  client refuses `publish(qos=2)` and caps a requested subscribe QoS at 1)
 - retained messages
-- Last Will and Testament
+- Last Will and Testament, including on client-id takeover
 - username/password authentication
 - topic wildcards (`+`, `#`)
 
 Out of scope: MQTT 5, bridging, clustering, TLS.
+
+Whole packets are capped at 1 MiB (`frame.MAX_PACKET_SIZE`); a larger remaining
+length is rejected before the body is allocated. Client ids must be non-empty.
 
 ## Layout
 
@@ -58,8 +62,17 @@ client.publish(?c, "sensors/room", data, len, 1, 0);
 client.disconnect(?c);
 ```
 
-The client is single-threaded: use one connection per thread, and do not
-interleave QoS 1 publishing with `next_message` on the same client.
+The client is single-threaded: use one connection per thread. Application
+messages that arrive while `subscribe`, `unsubscribe`, or a QoS 1 `publish` is
+waiting for its ack are acknowledged and buffered (up to `client.QUEUE_CAP`),
+then returned in order by `next_message`; if that bound is exceeded the control
+call returns an error rather than dropping a message. The `Message` handed back
+by `next_message` owns its topic and payload and stays valid until the following
+`next_message` call, so intervening control calls do not invalidate it.
+
+`client.options` defaults `keepalive` to 0 (disabled). A synchronous client
+cannot send PINGREQ while blocked in `next_message`, so set a nonzero keepalive
+only if the application drives `ping()` itself.
 
 ## Authentication
 
@@ -84,3 +97,10 @@ core.set_auth(?broker, check);
 - **Slow consumers**: the broker holds a single lock across socket writes, so a
   stalled subscriber can delay delivery to others. This is a correctness-first
   v0.1 choice, not a scalability target.
+- **Keepalive is not enforced**: the broker decodes the CONNECT keepalive but
+  does not disconnect a silent client at 1.5x keepalive, because the standard
+  library exposes no socket read timeout (no `SO_RCVTIMEO`/`poll` wrapper on
+  `tcp.Stream`). A will therefore fires on graceful disconnect and on client-id
+  takeover, but on a silent network partition it is delayed until the transport
+  itself reports the connection closed. Enforcing the deadline is blocked on a
+  stdlib read-timeout primitive.
