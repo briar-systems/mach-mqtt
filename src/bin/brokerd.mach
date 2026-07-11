@@ -1,6 +1,8 @@
 use std.runtime;
 
 use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
 use std.types.result.is_ok;
 use std.types.result.is_err;
 use std.types.result.unwrap_ok;
@@ -19,17 +21,28 @@ use serve: mqtt.broker.serve;
 
 val DEFAULT_PORT: u16 = 1883;
 
+# parse and range-check a decimal listen port argument
+# ---
+# arg: the argument string
+# ret: the port (0-65535), or an error on non-numeric or out-of-range input
+fun parse_port(arg: str) Result[u16, str] {
+    val pr: Result[u64, str] = parse.parse_u64_exact(arg, 10);
+    if (is_err[u64, str](pr)) { ret err[u16, str]("port is not a number"); }
+    val v: u64 = unwrap_ok[u64, str](pr);
+    if (v > 65535) { ret err[u16, str]("port out of range"); }
+    ret ok[u16, str](v::u16);
+}
+
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
     var port: u16 = DEFAULT_PORT;
     if (argc > 1) {
-        val a1: str = argv[1]::str;
-        val pr: Result[u64, str] = parse.parse_u64_exact(a1, 10);
-        if (is_err[u64, str](pr)) {
-            print.eprintln("usage: brokerd [port]");
+        val ppr: Result[u16, str] = parse_port(argv[1]::str);
+        if (is_err[u16, str](ppr)) {
+            print.eprintln("usage: brokerd [port]  (port must be 0-65535)");
             ret 1;
         }
-        port = unwrap_ok[u64, str](pr)::u16;
+        port = unwrap_ok[u16, str](ppr);
     }
 
     log.set_level(log.INFO);
@@ -52,5 +65,15 @@ fun main(argc: i64, argv: **u8) i64 {
     serve.serve(?b, ?ln);
 
     tcp.listener_close(?ln);
+    ret 0;
+}
+
+test "brokerd: parse_port range and format" {
+    if (unwrap_ok[u16, str](parse_port("1883")) != 1883) { ret 1; }
+    if (unwrap_ok[u16, str](parse_port("0")) != 0) { ret 1; }
+    if (unwrap_ok[u16, str](parse_port("65535")) != 65535) { ret 1; }
+    if (is_ok[u16, str](parse_port("65536"))) { ret 1; }
+    if (is_ok[u16, str](parse_port("70000"))) { ret 1; }
+    if (is_ok[u16, str](parse_port("abc"))) { ret 1; }
     ret 0;
 }

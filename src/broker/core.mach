@@ -25,6 +25,8 @@ use std.types.string.str;
 use std.types.string.str_len;
 use std.types.string.str_equals;
 use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
 use std.types.result.is_ok;
 use std.types.result.is_err;
 use std.types.result.unwrap_ok;
@@ -64,6 +66,7 @@ pub rec Sub {
 # will_retain:  will retain flag
 # will_topic:   owned will topic (valid when will_flag)
 # will_payload: owned will payload (valid when will_flag)
+# will_pending: 1 while the will still needs publishing on abnormal close
 # next_id:      outbound packet-identifier counter
 pub rec Session {
     client_id:    str;
@@ -76,6 +79,7 @@ pub rec Session {
     will_retain:  u8;
     will_topic:   str;
     will_payload: field.Blob;
+    will_pending: u8;
     next_id:      u16;
 }
 
@@ -136,10 +140,8 @@ fun min_qos(a: u8, b: u8) u8 {
     ret b;
 }
 
-fun heap_str(b: *Broker, s: str) str {
-    val r: Result[str, str] = field.own_str(s, b.heap);
-    if (is_err[str, str](r)) { ret nil; }
-    ret unwrap_ok[str, str](r);
+fun heap_str(b: *Broker, s: str) Result[str, str] {
+    ret field.own_str(s, b.heap);
 }
 
 fun free_str(b: *Broker, s: str) {
@@ -147,10 +149,8 @@ fun free_str(b: *Broker, s: str) {
     allocator.deallocate[u8](b.heap, s::*u8, str_len(s) + 1);
 }
 
-fun heap_blob(b: *Broker, data: *u8, len: usize) field.Blob {
-    val r: Result[field.Blob, str] = field.own_bytes(data, len, b.heap);
-    if (is_err[field.Blob, str](r)) { ret field.Blob{data: nil, len: 0}; }
-    ret unwrap_ok[field.Blob, str](r);
+fun heap_blob(b: *Broker, data: *u8, len: usize) Result[field.Blob, str] {
+    ret field.own_bytes(data, len, b.heap);
 }
 
 fun free_blob(b: *Broker, bl: field.Blob) {
@@ -261,7 +261,7 @@ fun route(b: *Broker, topic: str, payload: *u8, payload_len: usize, pub_qos: u8,
 }
 
 # update the retained store for a topic; caller holds the lock
-fun store_retained(b: *Broker, topic: str, payload: *u8, payload_len: usize, qos: u8) {
+fun store_retained(b: *Broker, topic: str, payload: *u8, payload_len: usize, qos: u8) Result[bool, str] {
     var idx:   usize = 0;
     var found: *Retained = nil;
     for (idx < vector.length[*Retained](b.retained)) {
@@ -280,23 +280,45 @@ fun store_retained(b: *Broker, topic: str, payload: *u8, payload_len: usize, qos
             @unwrap_ok[**Retained, str](vector.get[*Retained](?b.retained, idx)) = lp;
             vector.pop[*Retained](?b.retained);
         }
-        ret;
+        ret ok[bool, str](true);
     }
 
     if (found != nil) {
+        # allocate the replacement before freeing the old payload so a failed
+        # allocation leaves the existing retained message intact
+        val nb: Result[field.Blob, str] = heap_blob(b, payload, payload_len);
+        if (is_err[field.Blob, str](nb)) { ret err[bool, str]("retained payload alloc"); }
         free_blob(b, found.payload);
-        found.payload = heap_blob(b, payload, payload_len);
+        found.payload = unwrap_ok[field.Blob, str](nb);
         found.qos = qos;
-        ret;
+        ret ok[bool, str](true);
     }
 
     val ar: Result[*Retained, str] = allocator.allocate[Retained](b.heap, 1);
-    if (is_err[*Retained, str](ar)) { ret; }
+    if (is_err[*Retained, str](ar)) { ret err[bool, str]("retained alloc"); }
     val nr: *Retained = unwrap_ok[*Retained, str](ar);
-    nr.topic   = heap_str(b, topic);
-    nr.payload = heap_blob(b, payload, payload_len);
+
+    val tr: Result[str, str] = heap_str(b, topic);
+    if (is_err[str, str](tr)) {
+        allocator.deallocate[Retained](b.heap, nr, 1);
+        ret err[bool, str]("retained topic alloc");
+    }
+    val pb: Result[field.Blob, str] = heap_blob(b, payload, payload_len);
+    if (is_err[field.Blob, str](pb)) {
+        free_str(b, unwrap_ok[str, str](tr));
+        allocator.deallocate[Retained](b.heap, nr, 1);
+        ret err[bool, str]("retained payload alloc");
+    }
+    nr.topic   = unwrap_ok[str, str](tr);
+    nr.payload = unwrap_ok[field.Blob, str](pb);
     nr.qos     = qos;
-    vector.push[*Retained](?b.retained, nr);
+    if (is_err[usize, str](vector.push[*Retained](?b.retained, nr))) {
+        free_blob(b, nr.payload);
+        free_str(b, nr.topic);
+        allocator.deallocate[Retained](b.heap, nr, 1);
+        ret err[bool, str]("retained push");
+    }
+    ret ok[bool, str](true);
 }
 
 # send retained messages matching a new subscription; caller holds the lock
@@ -318,12 +340,20 @@ fun deliver_retained(b: *Broker, s: *Session, sub_filter: str, sub_qos: u8, scra
     }
 }
 
+# publish a session's will exactly once on abnormal close; caller holds the lock
+#
+# gated on will_pending so it fires whether the session closes on its own thread
+# or is evicted by a client-id takeover (MQTT-3.1.2-8), and never twice. a
+# graceful DISCONNECT clears will_pending, discarding the will.
 fun publish_will(b: *Broker, s: *Session, scratch: *allocator.Allocator) {
-    if (s.will_flag == 0) { ret; }
+    if (s.will_pending == 0) { ret; }
+    s.will_pending = 0;
+    route(b, s.will_topic, s.will_payload.data, s.will_payload.len, s.will_qos, scratch);
     if (s.will_retain != 0) {
+        # retained-will persistence is best-effort under the documented v0.1
+        # delivery limitation; the live delivery above always happens
         store_retained(b, s.will_topic, s.will_payload.data, s.will_payload.len, s.will_qos);
     }
-    route(b, s.will_topic, s.will_payload.data, s.will_payload.len, s.will_qos, scratch);
 }
 
 # per-connection serving state
@@ -334,7 +364,6 @@ fun publish_will(b: *Broker, s: *Session, scratch: *allocator.Allocator) {
 # scratch:  page allocator for encode scratch buffers
 # ar:       arena backing inbound packet decoding
 # arena_a:  allocator view over ar
-# graceful: 1 after a client DISCONNECT
 rec Conn {
     broker:   *Broker;
     stream:   tcp.Stream;
@@ -342,16 +371,22 @@ rec Conn {
     scratch:  allocator.Allocator;
     ar:       arena.Arena;
     arena_a:  allocator.Allocator;
-    graceful: u8;
 }
 
-fun handle_publish(c: *Conn, p: *packet.Packet) {
+# handle an inbound PUBLISH; returns false when the connection must be closed
+fun handle_publish(c: *Conn, p: *packet.Packet) bool {
     val b: *Broker = c.broker;
-    if (!filter.valid_topic_name(p.publish.topic)) { ret; }
+    # QoS 2 is out of scope; a QoS 2 PUBLISH is a protocol error here
+    if (p.qos > types.QOS1) { ret false; }
+    # a wildcard or empty publish topic is malformed (MQTT-3.3.2-2): close
+    if (!filter.valid_topic_name(p.publish.topic)) { ret false; }
 
     mutex.lock(?b.lock);
     if (p.retain != 0) {
-        store_retained(b, p.publish.topic, p.publish.payload.data, p.publish.payload.len, p.qos);
+        if (is_err[bool, str](store_retained(b, p.publish.topic, p.publish.payload.data, p.publish.payload.len, p.qos))) {
+            mutex.unlock(?b.lock);
+            ret false;
+        }
     }
     route(b, p.publish.topic, p.publish.payload.data, p.publish.payload.len, p.qos, ?c.scratch);
     if (p.qos == 1) {
@@ -360,22 +395,29 @@ fun handle_publish(c: *Conn, p: *packet.Packet) {
         send_fd(c.session.fd, ?ack, ?c.scratch);
     }
     mutex.unlock(?b.lock);
+    ret true;
 }
 
-fun upsert_sub(b: *Broker, s: *Session, f: str, qos: u8) {
+fun upsert_sub(b: *Broker, s: *Session, f: str, qos: u8) Result[bool, str] {
     var i: usize = 0;
     for (i < vector.length[Sub](s.subs)) {
         val sub: *Sub = unwrap_ok[*Sub, str](vector.get[Sub](?s.subs, i));
         if (str_equals(sub.filter, f)) {
             sub.qos = qos;
-            ret;
+            ret ok[bool, str](true);
         }
         i = i + 1;
     }
+    val fr: Result[str, str] = heap_str(b, f);
+    if (is_err[str, str](fr)) { ret err[bool, str]("sub filter alloc"); }
     var ns: Sub;
-    ns.filter = heap_str(b, f);
+    ns.filter = unwrap_ok[str, str](fr);
     ns.qos    = qos;
-    vector.push[Sub](?s.subs, ns);
+    if (is_err[usize, str](vector.push[Sub](?s.subs, ns))) {
+        free_str(b, ns.filter);
+        ret err[bool, str]("sub push");
+    }
+    ret ok[bool, str](true);
 }
 
 fun handle_subscribe(c: *Conn, p: *packet.Packet) {
@@ -392,7 +434,10 @@ fun handle_subscribe(c: *Conn, p: *packet.Packet) {
             cnt;
         }
         val gq: u8 = min_qos(tf.qos, types.QOS1);
-        upsert_sub(b, c.session, tf.filter, gq);
+        if (is_err[bool, str](upsert_sub(b, c.session, tf.filter, gq))) {
+            vector.push[u8](?codes, types.SUBACK_FAILURE);
+            cnt;
+        }
         vector.push[u8](?codes, gq);
     }
 
@@ -451,27 +496,66 @@ fun register(b: *Broker, c: *Conn, p: *packet.Packet) {
         var os: tcp.Stream = fd_stream(existing.fd);
         tcp.stream_shutdown(?os, 2);
         existing.connected = 0;
+        publish_will(b, existing, ?c.scratch);
         remove_session_ref(b, existing);
     }
 
     val ar: Result[*Session, str] = allocator.allocate[Session](b.heap, 1);
     if (is_err[*Session, str](ar)) { c.session = nil; ret; }
     val s: *Session = unwrap_ok[*Session, str](ar);
-    s.client_id = heap_str(b, p.connect.client_id);
-    s.fd        = c.stream.fd;
-    s.connected = 1;
-    s.clean     = p.connect.clean_session;
-    s.subs      = vector.init[Sub](b.heap);
-    s.next_id   = 0;
-    s.will_flag = 0;
+
+    val cidr: Result[str, str] = heap_str(b, p.connect.client_id);
+    if (is_err[str, str](cidr)) {
+        allocator.deallocate[Session](b.heap, s, 1);
+        c.session = nil;
+        ret;
+    }
+    s.client_id    = unwrap_ok[str, str](cidr);
+    s.fd           = c.stream.fd;
+    s.connected    = 1;
+    s.clean        = p.connect.clean_session;
+    s.subs         = vector.init[Sub](b.heap);
+    s.next_id      = 0;
+    s.will_flag    = 0;
+    s.will_pending = 0;
+
     if (p.connect.will_flag != 0) {
+        val wtr: Result[str, str] = heap_str(b, p.connect.will_topic);
+        if (is_err[str, str](wtr)) {
+            free_str(b, s.client_id);
+            vector.dnit[Sub](?s.subs);
+            allocator.deallocate[Session](b.heap, s, 1);
+            c.session = nil;
+            ret;
+        }
+        val wpr: Result[field.Blob, str] = heap_blob(b, p.connect.will_payload.data, p.connect.will_payload.len);
+        if (is_err[field.Blob, str](wpr)) {
+            free_str(b, unwrap_ok[str, str](wtr));
+            free_str(b, s.client_id);
+            vector.dnit[Sub](?s.subs);
+            allocator.deallocate[Session](b.heap, s, 1);
+            c.session = nil;
+            ret;
+        }
         s.will_flag    = 1;
+        s.will_pending = 1;
         s.will_qos     = p.connect.will_qos;
         s.will_retain  = p.connect.will_retain;
-        s.will_topic   = heap_str(b, p.connect.will_topic);
-        s.will_payload = heap_blob(b, p.connect.will_payload.data, p.connect.will_payload.len);
+        s.will_topic   = unwrap_ok[str, str](wtr);
+        s.will_payload = unwrap_ok[field.Blob, str](wpr);
     }
-    vector.push[*Session](?b.sessions, s);
+
+    if (is_err[usize, str](vector.push[*Session](?b.sessions, s))) {
+        if (s.will_flag != 0) {
+            free_str(b, s.will_topic);
+            free_blob(b, s.will_payload);
+        }
+        free_str(b, s.client_id);
+        vector.dnit[Sub](?s.subs);
+        allocator.deallocate[Session](b.heap, s, 1);
+        c.session = nil;
+        ret;
+    }
     c.session = s;
 }
 
@@ -499,11 +583,8 @@ fun authenticate(c: *Conn, p: *packet.Packet) bool {
 fun disconnect(b: *Broker, c: *Conn) {
     mutex.lock(?b.lock);
     val s: *Session = c.session;
-    val present: bool = session_present(b, s);
-    if (present) {
-        if (c.graceful == 0) { publish_will(b, s, ?c.scratch); }
-        remove_session_ref(b, s);
-    }
+    publish_will(b, s, ?c.scratch);
+    if (session_present(b, s)) { remove_session_ref(b, s); }
     free_session(b, s);
     mutex.unlock(?b.lock);
 }
@@ -517,7 +598,6 @@ pub fun handle_connection(b: *Broker, stream: tcp.Stream) {
     c.broker   = b;
     c.stream   = stream;
     c.session  = nil;
-    c.graceful = 0;
     page.make(?c.scratch);
     arena.init(?c.ar, ?c.scratch, 4096);
     arena.make(?c.arena_a, ?c.ar);
@@ -531,6 +611,17 @@ pub fun handle_connection(b: *Broker, stream: tcp.Stream) {
         var nack: packet.Packet = packet.zero(types.CONNACK);
         nack.connack.return_code = types.CONNACK_NOT_AUTHORIZED;
         frame.write_to(?c.stream, ?nack, ?c.scratch);
+        tcp.stream_close(?c.stream);
+        arena.dnit(?c.ar);
+        ret;
+    }
+
+    # empty client ids all alias one identity, so reject them (MQTT-3.1.3-8);
+    # v0.1 requires a non-empty client id regardless of clean_session
+    if (str_len(cp.connect.client_id) == 0) {
+        var rej: packet.Packet = packet.zero(types.CONNACK);
+        rej.connack.return_code = types.CONNACK_IDENTIFIER_REJECTED;
+        frame.write_to(?c.stream, ?rej, ?c.scratch);
         tcp.stream_close(?c.stream);
         arena.dnit(?c.ar);
         ret;
@@ -554,7 +645,9 @@ pub fun handle_connection(b: *Broker, stream: tcp.Stream) {
         if (is_err[packet.Packet, str](pr)) { brk; }
         var p: packet.Packet = unwrap_ok[packet.Packet, str](pr);
 
-        if (p.kind == types.PUBLISH) { handle_publish(?c, ?p); }
+        if (p.kind == types.PUBLISH) {
+            if (!handle_publish(?c, ?p)) { brk; }
+        }
         or (p.kind == types.SUBSCRIBE) { handle_subscribe(?c, ?p); }
         or (p.kind == types.UNSUBSCRIBE) { handle_unsubscribe(?c, ?p); }
         or (p.kind == types.PINGREQ) {
@@ -563,7 +656,12 @@ pub fun handle_connection(b: *Broker, stream: tcp.Stream) {
             send_fd(c.session.fd, ?pong, ?c.scratch);
             mutex.unlock(?b.lock);
         }
-        or (p.kind == types.DISCONNECT) { c.graceful = 1; brk; }
+        or (p.kind == types.DISCONNECT) {
+            mutex.lock(?b.lock);
+            c.session.will_pending = 0;
+            mutex.unlock(?b.lock);
+            brk;
+        }
     }
 
     disconnect(b, ?c);
