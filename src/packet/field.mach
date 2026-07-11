@@ -1,0 +1,249 @@
+# MQTT wire field primitives
+#
+# encodes and decodes the field types shared by every control packet: big-endian
+# 16-bit integers, length-prefixed UTF-8 strings, and length-prefixed binary
+# data. decode helpers allocate owned, null-terminated copies so callers can use
+# them as `str`; free them with the owning packet's dnit.
+
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_ok;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.string.str_equals;
+
+use buffer:    std.io.buffer;
+use allocator: std.allocator;
+use page:      std.allocator.page;
+use mem:       std.memory;
+
+# a length-counted binary blob with owned backing storage
+# ---
+# data: pointer to the bytes (nil when len is 0)
+# len:  number of bytes
+pub rec Blob {
+    data: *u8;
+    len:  usize;
+}
+
+# write a big-endian 16-bit integer
+# ---
+# buf: destination buffer
+# v:   value to write
+# ret: new buffer length, or an error
+pub fun write_u16(buf: *buffer.WriteBuf, v: u16) Result[usize, str] {
+    val hi: Result[usize, str] = buffer.wbuf_write[u8](buf, (v >> 8)::u8);
+    if (is_err[usize, str](hi)) { ret hi; }
+    ret buffer.wbuf_write[u8](buf, (v & 255)::u8);
+}
+
+# read a big-endian 16-bit integer
+# ---
+# buf: source buffer
+# ret: the value, or an error on truncation
+pub fun read_u16(buf: *buffer.ReadBuf) Result[u16, str] {
+    val a: Result[u8, str] = buffer.rbuf_read[u8](buf);
+    if (is_err[u8, str](a)) { ret err[u16, str]("truncated u16"); }
+    val b: Result[u8, str] = buffer.rbuf_read[u8](buf);
+    if (is_err[u8, str](b)) { ret err[u16, str]("truncated u16"); }
+    ret ok[u16, str]((unwrap_ok[u8, str](a)::u16 << 8) | unwrap_ok[u8, str](b)::u16);
+}
+
+# write a length-prefixed UTF-8 string (two-byte length, then raw bytes)
+# ---
+# buf: destination buffer
+# s:   null-terminated string to write
+# ret: new buffer length, or an error
+pub fun write_string(buf: *buffer.WriteBuf, s: str) Result[usize, str] {
+    val n: usize = str_len(s);
+    if (n > 65535) { ret err[usize, str]("string exceeds 65535 bytes"); }
+
+    val lr: Result[usize, str] = write_u16(buf, n::u16);
+    if (is_err[usize, str](lr)) { ret lr; }
+    if (n == 0) { ret lr; }
+    ret buffer.wbuf_write_bytes(buf, s::*u8, n);
+}
+
+# read a length-prefixed UTF-8 string into an owned, null-terminated copy
+# ---
+# buf: source buffer
+# a:   allocator for the copy
+# ret: the owned string, or an error
+pub fun read_string(buf: *buffer.ReadBuf, a: *allocator.Allocator) Result[str, str] {
+    val lr: Result[u16, str] = read_u16(buf);
+    if (is_err[u16, str](lr)) { ret err[str, str]("truncated string length"); }
+    val n: usize = unwrap_ok[u16, str](lr)::usize;
+
+    val br: Result[*u8, str] = buffer.rbuf_read_bytes(buf, n);
+    if (is_err[*u8, str](br)) { ret err[str, str]("truncated string body"); }
+    val src: *u8 = unwrap_ok[*u8, str](br);
+
+    val ar: Result[*u8, str] = allocator.allocate[u8](a, n + 1);
+    if (is_err[*u8, str](ar)) { ret err[str, str](unwrap_err[*u8, str](ar)); }
+    val dst: *u8 = unwrap_ok[*u8, str](ar);
+
+    if (n > 0) { mem.raw_copy(dst::ptr, src::ptr, n); }
+    dst[n] = 0;
+    ret ok[str, str](dst::str);
+}
+
+# write a length-prefixed binary blob (two-byte length, then raw bytes)
+# ---
+# buf:  destination buffer
+# data: pointer to the bytes
+# len:  number of bytes
+# ret:  new buffer length, or an error
+pub fun write_blob(buf: *buffer.WriteBuf, data: *u8, len: usize) Result[usize, str] {
+    if (len > 65535) { ret err[usize, str]("blob exceeds 65535 bytes"); }
+    val lr: Result[usize, str] = write_u16(buf, len::u16);
+    if (is_err[usize, str](lr)) { ret lr; }
+    if (len == 0) { ret lr; }
+    ret buffer.wbuf_write_bytes(buf, data, len);
+}
+
+# read a length-prefixed binary blob into an owned copy
+# ---
+# buf: source buffer
+# a:   allocator for the copy
+# ret: the owned blob, or an error
+pub fun read_blob(buf: *buffer.ReadBuf, a: *allocator.Allocator) Result[Blob, str] {
+    val lr: Result[u16, str] = read_u16(buf);
+    if (is_err[u16, str](lr)) { ret err[Blob, str]("truncated blob length"); }
+    val n: usize = unwrap_ok[u16, str](lr)::usize;
+
+    var out: Blob;
+    out.len = n;
+    out.data = nil;
+    if (n == 0) { ret ok[Blob, str](out); }
+
+    val br: Result[*u8, str] = buffer.rbuf_read_bytes(buf, n);
+    if (is_err[*u8, str](br)) { ret err[Blob, str]("truncated blob body"); }
+
+    val ar: Result[*u8, str] = allocator.allocate[u8](a, n);
+    if (is_err[*u8, str](ar)) { ret err[Blob, str](unwrap_err[*u8, str](ar)); }
+    out.data = unwrap_ok[*u8, str](ar);
+    mem.raw_copy(out.data::ptr, unwrap_ok[*u8, str](br)::ptr, n);
+    ret ok[Blob, str](out);
+}
+
+# copy raw bytes into an owned buffer, used for the trailing PUBLISH payload
+# ---
+# src: source bytes (may be nil when len is 0)
+# len: number of bytes
+# a:   allocator for the copy
+# ret: the owned blob, or an error
+pub fun own_bytes(src: *u8, len: usize, a: *allocator.Allocator) Result[Blob, str] {
+    var out: Blob;
+    out.len = len;
+    out.data = nil;
+    if (len == 0) { ret ok[Blob, str](out); }
+
+    val ar: Result[*u8, str] = allocator.allocate[u8](a, len);
+    if (is_err[*u8, str](ar)) { ret err[Blob, str](unwrap_err[*u8, str](ar)); }
+    out.data = unwrap_ok[*u8, str](ar);
+    mem.raw_copy(out.data::ptr, src::ptr, len);
+    ret ok[Blob, str](out);
+}
+
+# copy a null-terminated string into an owned copy
+# ---
+# s: source string (may be nil)
+# a: allocator for the copy
+# ret: the owned string, or an error
+pub fun own_str(s: str, a: *allocator.Allocator) Result[str, str] {
+    var n: usize = 0;
+    if (s != nil) { n = str_len(s); }
+
+    val ar: Result[*u8, str] = allocator.allocate[u8](a, n + 1);
+    if (is_err[*u8, str](ar)) { ret err[str, str](unwrap_err[*u8, str](ar)); }
+    val dst: *u8 = unwrap_ok[*u8, str](ar);
+    if (n > 0) { mem.raw_copy(dst::ptr, s::ptr, n); }
+    dst[n] = 0;
+    ret ok[str, str](dst::str);
+}
+
+test "field: u16 big-endian round-trip" {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var wb: buffer.WriteBuf = buffer.wbuf_make(?a);
+    write_u16(?wb, 0x1234);
+    if (wb.data[0] != 0x12) { buffer.wbuf_dnit(?wb); ret 1; }
+    if (wb.data[1] != 0x34) { buffer.wbuf_dnit(?wb); ret 1; }
+    var rb: buffer.ReadBuf = buffer.rbuf_make(wb.data, wb.len);
+    val r: Result[u16, str] = read_u16(?rb);
+    buffer.wbuf_dnit(?wb);
+    if (is_err[u16, str](r)) { ret 1; }
+    if (unwrap_ok[u16, str](r) != 0x1234) { ret 1; }
+    ret 0;
+}
+
+test "field: string round-trip" {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var wb: buffer.WriteBuf = buffer.wbuf_make(?a);
+    write_string(?wb, "hello/world");
+    if (wb.data[0] != 0) { buffer.wbuf_dnit(?wb); ret 1; }
+    if (wb.data[1] != 11) { buffer.wbuf_dnit(?wb); ret 1; }
+    var rb: buffer.ReadBuf = buffer.rbuf_make(wb.data, wb.len);
+    val r: Result[str, str] = read_string(?rb, ?a);
+    buffer.wbuf_dnit(?wb);
+    if (is_err[str, str](r)) { ret 1; }
+    if (!str_equals(unwrap_ok[str, str](r), "hello/world")) { ret 1; }
+    ret 0;
+}
+
+test "field: empty string round-trip" {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var wb: buffer.WriteBuf = buffer.wbuf_make(?a);
+    write_string(?wb, "");
+    var rb: buffer.ReadBuf = buffer.rbuf_make(wb.data, wb.len);
+    val r: Result[str, str] = read_string(?rb, ?a);
+    buffer.wbuf_dnit(?wb);
+    if (is_err[str, str](r)) { ret 1; }
+    if (!str_equals(unwrap_ok[str, str](r), "")) { ret 1; }
+    ret 0;
+}
+
+test "field: blob round-trip" {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var wb: buffer.WriteBuf = buffer.wbuf_make(?a);
+    var src: [3]u8 = [3]u8{0xDE, 0xAD, 0xBE};
+    write_blob(?wb, ?src[0], 3);
+    var rb: buffer.ReadBuf = buffer.rbuf_make(wb.data, wb.len);
+    val r: Result[Blob, str] = read_blob(?rb, ?a);
+    buffer.wbuf_dnit(?wb);
+    if (is_err[Blob, str](r)) { ret 1; }
+    val b: Blob = unwrap_ok[Blob, str](r);
+    if (b.len != 3) { ret 1; }
+    if (b.data[0] != 0xDE) { ret 1; }
+    if (b.data[2] != 0xBE) { ret 1; }
+    ret 0;
+}
+
+test "field: own_str copies content" {
+    var a: allocator.Allocator;
+    page.make(?a);
+    val r: Result[str, str] = own_str("device-42", ?a);
+    if (is_err[str, str](r)) { ret 1; }
+    if (!str_equals(unwrap_ok[str, str](r), "device-42")) { ret 1; }
+    ret 0;
+}
+
+test "field: read_u16 truncated" {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var wb: buffer.WriteBuf = buffer.wbuf_make(?a);
+    buffer.wbuf_write[u8](?wb, 0x12);
+    var rb: buffer.ReadBuf = buffer.rbuf_make(wb.data, wb.len);
+    val r: Result[u16, str] = read_u16(?rb);
+    buffer.wbuf_dnit(?wb);
+    if (is_ok[u16, str](r)) { ret 1; }
+    ret 0;
+}
