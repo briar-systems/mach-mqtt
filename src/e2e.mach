@@ -35,6 +35,14 @@ fun serve_entry() {
     serve.serve(?g_broker, ?g_listener);
 }
 
+var f_heap:     allocator.Allocator;
+var f_broker:   core.Broker;
+var f_listener: tcp.Listener;
+
+fun fixes_serve_entry() {
+    serve.serve(?f_broker, ?f_listener);
+}
+
 fun payload_is(m: *client.Message, expect: str) bool {
     var i: usize = 0;
     for (expect[i] != 0) { i = i + 1; }
@@ -121,4 +129,92 @@ test "e2e: pub/sub, retained, and will through the broker" {
 
 fun client_blob(data: *u8, len: usize) field.Blob {
     ret field.Blob{data: data, len: len};
+}
+
+test "e2e: v0.1 conformance fixes through the broker" {
+    page.make(?f_heap);
+    core.init(?f_broker, ?f_heap);
+
+    val ep: ip.Endpoint = ip.endpoint(127, 0, 0, 1, 17654);
+    val lr: Result[tcp.Listener, str] = tcp.listen(ep, 16);
+    if (is_err[tcp.Listener, str](lr)) { ret 1; }
+    f_listener = unwrap_ok[tcp.Listener, str](lr);
+
+    var th: thread.Thread;
+    thread.spawn(fixes_serve_entry, ?th);
+    if (th.tid < 0) { ret 1; }
+
+    # empty client id is rejected, and cleanup after a failed connect is safe
+    var empty_opts: client.Options = client.options("");
+    var cempty: client.Client;
+    if (is_ok[bool, str](client.connect(?cempty, ep, ?empty_opts))) { ret 2; }
+    client.disconnect(?cempty);
+    client.close(?cempty);
+
+    # a message that arrives during a control call is queued, not dropped, and
+    # survives a later control call
+    var sub_opts: client.Options = client.options("f-sub");
+    var csub: client.Client;
+    if (is_err[bool, str](client.connect(?csub, ep, ?sub_opts))) { ret 3; }
+    if (is_err[u8, str](client.subscribe(?csub, "f/data", 1))) { ret 4; }
+
+    var pub_opts: client.Options = client.options("f-pub");
+    var cpub: client.Client;
+    if (is_err[bool, str](client.connect(?cpub, ep, ?pub_opts))) { ret 5; }
+    var m1: [2]u8 = [2]u8{'M', '1'};
+    # QoS 1 publish returns only after the broker has routed it to csub, so the
+    # delivery is now buffered on csub's socket ahead of the next control call
+    if (is_err[bool, str](client.publish(?cpub, "f/data", ?m1[0], 2, 1, 0))) { ret 6; }
+
+    # this subscribe's ack-wait reads the interleaved f/data PUBLISH first
+    if (is_err[u8, str](client.subscribe(?csub, "f/other", 1))) { ret 7; }
+
+    var qmsg: client.Message;
+    if (is_err[bool, str](client.next_message(?csub, ?qmsg))) { ret 8; }
+    if (!str_equals(qmsg.topic, "f/data")) { ret 9; }
+    if (!payload_is(?qmsg, "M1")) { ret 10; }
+
+    # a further control call must not corrupt the borrowed message
+    if (is_err[u8, str](client.subscribe(?csub, "f/third", 1))) { ret 11; }
+    if (!str_equals(qmsg.topic, "f/data")) { ret 12; }
+    if (!payload_is(?qmsg, "M1")) { ret 13; }
+
+    # an invalid publish topic closes the connection instead of silently dropping
+    var bad_opts: client.Options = client.options("f-bad");
+    var cbad: client.Client;
+    if (is_err[bool, str](client.connect(?cbad, ep, ?bad_opts))) { ret 14; }
+    var bb: [1]u8 = [1]u8{'x'};
+    if (is_ok[bool, str](client.publish(?cbad, "bad/+/x", ?bb[0], 1, 1, 0))) { ret 15; }
+    client.disconnect(?cbad);
+
+    # session takeover publishes the evicted client's will
+    var watch_opts: client.Options = client.options("f-watch");
+    var cwatch: client.Client;
+    if (is_err[bool, str](client.connect(?cwatch, ep, ?watch_opts))) { ret 16; }
+    if (is_err[u8, str](client.subscribe(?cwatch, "f/down", 0))) { ret 17; }
+
+    var wpay: [4]u8 = [4]u8{'G', 'O', 'N', 'E'};
+    var victim_opts: client.Options = client.options("f-dup");
+    victim_opts.will_flag = 1;
+    victim_opts.will_topic = "f/down";
+    victim_opts.will_payload = client_blob(?wpay[0], 4);
+    victim_opts.will_qos = 0;
+    var cvictim: client.Client;
+    if (is_err[bool, str](client.connect(?cvictim, ep, ?victim_opts))) { ret 18; }
+
+    var taker_opts: client.Options = client.options("f-dup");
+    var ctaker: client.Client;
+    if (is_err[bool, str](client.connect(?ctaker, ep, ?taker_opts))) { ret 19; }
+
+    var wmsg: client.Message;
+    if (is_err[bool, str](client.next_message(?cwatch, ?wmsg))) { ret 20; }
+    if (!str_equals(wmsg.topic, "f/down")) { ret 21; }
+    if (!payload_is(?wmsg, "GONE")) { ret 22; }
+
+    client.disconnect(?csub);
+    client.disconnect(?cpub);
+    client.disconnect(?cwatch);
+    client.disconnect(?cvictim);
+    client.disconnect(?ctaker);
+    ret 0;
 }
