@@ -1,0 +1,670 @@
+# MQTT broker core
+#
+# a transport-attached broker: sessions, subscription routing with +/# wildcard
+# matching, retained messages, last-will dispatch, and a username/password auth
+# hook. one OS thread serves each connection; a single broker mutex guards all
+# shared state and serializes every socket write so concurrent deliveries to the
+# same client cannot interleave on the wire.
+#
+# ownership: each Session object is owned solely by the connection thread that
+# created it and is freed only by that thread on disconnect. a reconnect under an
+# existing client id evicts the old session from the routing set (shutting its
+# socket); the evicted thread frees its own object once it unblocks. sessions are
+# therefore per-connection: clean_session=0 is accepted but not persisted across
+# reconnects (a v0.1 limitation).
+#
+# scope: QoS 0 and 1. inbound QoS 1 PUBLISH is acknowledged with PUBACK; delivery
+# to subscribers is best-effort at the negotiated QoS without inflight-retry
+# tracking, which is sufficient over a reliable local transport.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.string.str_equals;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_ok;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+
+use allocator: std.allocator;
+use page:      std.allocator.page;
+use arena:     std.allocator.arena;
+use vector:    std.collections.vector;
+use mutex:     std.sync.mutex;
+use tcp:       std.net.tcp;
+use mem:       std.memory;
+
+use types:  mqtt.packet.types;
+use packet: mqtt.packet.packet;
+use field:  mqtt.packet.field;
+use frame:  mqtt.packet.frame;
+use filter: mqtt.broker.filter;
+
+# a single client subscription
+# ---
+# filter: owned topic filter
+# qos:    maximum QoS granted for this subscription
+pub rec Sub {
+    filter: str;
+    qos:    u8;
+}
+
+# a broker-side client session
+# ---
+# client_id:    owned client identifier
+# fd:           connection socket descriptor
+# connected:    1 while a connection is attached
+# clean:        clean-session flag from CONNECT
+# subs:         active subscriptions
+# will_flag:    1 if a will message is registered
+# will_qos:     will QoS
+# will_retain:  will retain flag
+# will_topic:   owned will topic (valid when will_flag)
+# will_payload: owned will payload (valid when will_flag)
+# will_pending: 1 while the will still needs publishing on abnormal close
+# next_id:      outbound packet-identifier counter
+pub rec Session {
+    client_id:    str;
+    fd:           i32;
+    connected:    u8;
+    clean:        u8;
+    subs:         vector.Vector[Sub];
+    will_flag:    u8;
+    will_qos:     u8;
+    will_retain:  u8;
+    will_topic:   str;
+    will_payload: field.Blob;
+    will_pending: u8;
+    next_id:      u16;
+}
+
+# a retained message, one per topic
+# ---
+# topic:   owned topic name
+# payload: owned payload bytes
+# qos:     QoS the message was published with
+pub rec Retained {
+    topic:   str;
+    payload: field.Blob;
+    qos:     u8;
+}
+
+# broker shared state
+# ---
+# lock:         guards all fields and serializes socket writes
+# heap:         durable allocator for owned session and retained storage
+# sessions:     currently connected sessions
+# retained:     retained messages by topic
+# auth_fn:      username/password check; called only when auth_enabled
+# auth_enabled: 1 when auth_fn is set
+pub rec Broker {
+    lock:         mutex.Mutex;
+    heap:         *allocator.Allocator;
+    sessions:     vector.Vector[*Session];
+    retained:     vector.Vector[*Retained];
+    auth_fn:      fun(str, str) bool;
+    auth_enabled: u8;
+}
+
+# initialize a broker
+# ---
+# b:    broker to initialize
+# heap: durable allocator for owned storage (must outlive the broker)
+pub fun init(b: *Broker, heap: *allocator.Allocator) {
+    b.lock         = mutex.make();
+    b.heap         = heap;
+    b.sessions     = vector.init[*Session](heap);
+    b.retained     = vector.init[*Retained](heap);
+    b.auth_enabled = 0;
+}
+
+# install a username/password authentication hook
+#
+# the hook receives the CONNECT username and a null-terminated password (both nil
+# when absent) and returns true to accept the connection.
+# ---
+# b:  broker to configure
+# fn: authentication callback
+pub fun set_auth(b: *Broker, fn: fun(str, str) bool) {
+    b.auth_fn      = fn;
+    b.auth_enabled = 1;
+}
+
+fun min_qos(a: u8, b: u8) u8 {
+    if (a < b) { ret a; }
+    ret b;
+}
+
+fun heap_str(b: *Broker, s: str) Result[str, str] {
+    ret field.own_str(s, b.heap);
+}
+
+fun free_str(b: *Broker, s: str) {
+    if (s == nil) { ret; }
+    allocator.deallocate[u8](b.heap, s::*u8, str_len(s) + 1);
+}
+
+fun heap_blob(b: *Broker, data: *u8, len: usize) Result[field.Blob, str] {
+    ret field.own_bytes(data, len, b.heap);
+}
+
+fun free_blob(b: *Broker, bl: field.Blob) {
+    if (bl.data == nil || bl.len == 0) { ret; }
+    allocator.deallocate[u8](b.heap, bl.data, bl.len);
+}
+
+fun next_packet_id(s: *Session) u16 {
+    s.next_id = s.next_id + 1;
+    if (s.next_id == 0) { s.next_id = 1; }
+    ret s.next_id;
+}
+
+# build a transient stream over a session fd for writing
+fun fd_stream(fd: i32) tcp.Stream {
+    ret tcp.Stream{fd: fd};
+}
+
+# write a packet to a fd; caller must hold the broker lock
+fun send_fd(fd: i32, p: *packet.Packet, scratch: *allocator.Allocator) bool {
+    var s: tcp.Stream = fd_stream(fd);
+    ret is_ok[usize, str](frame.write_to(?s, p, scratch));
+}
+
+# find a connected session by client id; caller must hold the broker lock
+fun find_session(b: *Broker, client_id: str) *Session {
+    var i: usize = 0;
+    for (i < vector.length[*Session](b.sessions)) {
+        val sp: *Session = @unwrap_ok[**Session, str](vector.get[*Session](?b.sessions, i));
+        if (str_equals(sp.client_id, client_id)) { ret sp; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# report whether a session pointer is still in the routing set; lock held
+fun session_present(b: *Broker, target: *Session) bool {
+    var i: usize = 0;
+    for (i < vector.length[*Session](b.sessions)) {
+        val sp: *Session = @unwrap_ok[**Session, str](vector.get[*Session](?b.sessions, i));
+        if (sp == target) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun remove_session_ref(b: *Broker, target: *Session) {
+    var i: usize = 0;
+    for (i < vector.length[*Session](b.sessions)) {
+        val sp: *Session = @unwrap_ok[**Session, str](vector.get[*Session](?b.sessions, i));
+        if (sp == target) {
+            val last: usize = vector.length[*Session](b.sessions) - 1;
+            val lp: *Session = @unwrap_ok[**Session, str](vector.get[*Session](?b.sessions, last));
+            @unwrap_ok[**Session, str](vector.get[*Session](?b.sessions, i)) = lp;
+            vector.pop[*Session](?b.sessions);
+            ret;
+        }
+        i = i + 1;
+    }
+}
+
+fun free_session(b: *Broker, s: *Session) {
+    var i: usize = 0;
+    for (i < vector.length[Sub](s.subs)) {
+        val sub: *Sub = unwrap_ok[*Sub, str](vector.get[Sub](?s.subs, i));
+        free_str(b, sub.filter);
+        i = i + 1;
+    }
+    vector.dnit[Sub](?s.subs);
+    if (s.will_flag != 0) {
+        free_str(b, s.will_topic);
+        free_blob(b, s.will_payload);
+    }
+    free_str(b, s.client_id);
+    allocator.deallocate[Session](b.heap, s, 1);
+}
+
+# deliver a message to every matching connected session; caller holds the lock
+fun route(b: *Broker, topic: str, payload: *u8, payload_len: usize, pub_qos: u8, scratch: *allocator.Allocator) {
+    var i: usize = 0;
+    for (i < vector.length[*Session](b.sessions)) {
+        val s: *Session = @unwrap_ok[**Session, str](vector.get[*Session](?b.sessions, i));
+        i = i + 1;
+        if (s.connected == 0) { cnt; }
+
+        var matched: bool = false;
+        var best: u8 = 0;
+        var j: usize = 0;
+        for (j < vector.length[Sub](s.subs)) {
+            val sub: *Sub = unwrap_ok[*Sub, str](vector.get[Sub](?s.subs, j));
+            if (filter.matches(sub.filter, topic)) {
+                if (!matched || sub.qos > best) { best = sub.qos; }
+                matched = true;
+            }
+            j = j + 1;
+        }
+        if (!matched) { cnt; }
+
+        val eff: u8 = min_qos(best, pub_qos);
+        var out: packet.Packet = packet.zero(types.PUBLISH);
+        out.qos = eff;
+        out.retain = 0;
+        out.publish.topic = topic;
+        out.publish.payload = field.Blob{data: payload, len: payload_len};
+        if (eff > 0) { out.id = next_packet_id(s); }
+        send_fd(s.fd, ?out, scratch);
+    }
+}
+
+# update the retained store for a topic; caller holds the lock
+fun store_retained(b: *Broker, topic: str, payload: *u8, payload_len: usize, qos: u8) Result[bool, str] {
+    var idx:   usize = 0;
+    var found: *Retained = nil;
+    for (idx < vector.length[*Retained](b.retained)) {
+        val rp: *Retained = @unwrap_ok[**Retained, str](vector.get[*Retained](?b.retained, idx));
+        if (str_equals(rp.topic, topic)) { found = rp; brk; }
+        idx = idx + 1;
+    }
+
+    if (payload_len == 0) {
+        if (found != nil) {
+            free_str(b, found.topic);
+            free_blob(b, found.payload);
+            allocator.deallocate[Retained](b.heap, found, 1);
+            val last: usize = vector.length[*Retained](b.retained) - 1;
+            val lp: *Retained = @unwrap_ok[**Retained, str](vector.get[*Retained](?b.retained, last));
+            @unwrap_ok[**Retained, str](vector.get[*Retained](?b.retained, idx)) = lp;
+            vector.pop[*Retained](?b.retained);
+        }
+        ret ok[bool, str](true);
+    }
+
+    if (found != nil) {
+        # allocate the replacement before freeing the old payload so a failed
+        # allocation leaves the existing retained message intact
+        val nb: Result[field.Blob, str] = heap_blob(b, payload, payload_len);
+        if (is_err[field.Blob, str](nb)) { ret err[bool, str]("retained payload alloc"); }
+        free_blob(b, found.payload);
+        found.payload = unwrap_ok[field.Blob, str](nb);
+        found.qos = qos;
+        ret ok[bool, str](true);
+    }
+
+    val ar: Result[*Retained, str] = allocator.allocate[Retained](b.heap, 1);
+    if (is_err[*Retained, str](ar)) { ret err[bool, str]("retained alloc"); }
+    val nr: *Retained = unwrap_ok[*Retained, str](ar);
+
+    val tr: Result[str, str] = heap_str(b, topic);
+    if (is_err[str, str](tr)) {
+        allocator.deallocate[Retained](b.heap, nr, 1);
+        ret err[bool, str]("retained topic alloc");
+    }
+    val pb: Result[field.Blob, str] = heap_blob(b, payload, payload_len);
+    if (is_err[field.Blob, str](pb)) {
+        free_str(b, unwrap_ok[str, str](tr));
+        allocator.deallocate[Retained](b.heap, nr, 1);
+        ret err[bool, str]("retained payload alloc");
+    }
+    nr.topic   = unwrap_ok[str, str](tr);
+    nr.payload = unwrap_ok[field.Blob, str](pb);
+    nr.qos     = qos;
+    if (is_err[usize, str](vector.push[*Retained](?b.retained, nr))) {
+        free_blob(b, nr.payload);
+        free_str(b, nr.topic);
+        allocator.deallocate[Retained](b.heap, nr, 1);
+        ret err[bool, str]("retained push");
+    }
+    ret ok[bool, str](true);
+}
+
+# send retained messages matching a new subscription; caller holds the lock
+fun deliver_retained(b: *Broker, s: *Session, sub_filter: str, sub_qos: u8, scratch: *allocator.Allocator) {
+    var i: usize = 0;
+    for (i < vector.length[*Retained](b.retained)) {
+        val rp: *Retained = @unwrap_ok[**Retained, str](vector.get[*Retained](?b.retained, i));
+        i = i + 1;
+        if (!filter.matches(sub_filter, rp.topic)) { cnt; }
+
+        val eff: u8 = min_qos(sub_qos, rp.qos);
+        var out: packet.Packet = packet.zero(types.PUBLISH);
+        out.qos = eff;
+        out.retain = 1;
+        out.publish.topic = rp.topic;
+        out.publish.payload = rp.payload;
+        if (eff > 0) { out.id = next_packet_id(s); }
+        send_fd(s.fd, ?out, scratch);
+    }
+}
+
+# publish a session's will exactly once on abnormal close; caller holds the lock
+#
+# gated on will_pending so it fires whether the session closes on its own thread
+# or is evicted by a client-id takeover (MQTT-3.1.2-8), and never twice. a
+# graceful DISCONNECT clears will_pending, discarding the will.
+fun publish_will(b: *Broker, s: *Session, scratch: *allocator.Allocator) {
+    if (s.will_pending == 0) { ret; }
+    s.will_pending = 0;
+    route(b, s.will_topic, s.will_payload.data, s.will_payload.len, s.will_qos, scratch);
+    if (s.will_retain != 0) {
+        # retained-will persistence is best-effort under the documented v0.1
+        # delivery limitation; the live delivery above always happens
+        store_retained(b, s.will_topic, s.will_payload.data, s.will_payload.len, s.will_qos);
+    }
+}
+
+# per-connection serving state
+# ---
+# broker:   the broker being served
+# stream:   this connection's stream
+# session:  this connection's owned session (nil until registered)
+# scratch:  page allocator for encode scratch buffers
+# ar:       arena backing inbound packet decoding
+# arena_a:  allocator view over ar
+rec Conn {
+    broker:   *Broker;
+    stream:   tcp.Stream;
+    session:  *Session;
+    scratch:  allocator.Allocator;
+    ar:       arena.Arena;
+    arena_a:  allocator.Allocator;
+}
+
+# handle an inbound PUBLISH; returns false when the connection must be closed
+fun handle_publish(c: *Conn, p: *packet.Packet) bool {
+    val b: *Broker = c.broker;
+    # QoS 2 is out of scope; a QoS 2 PUBLISH is a protocol error here
+    if (p.qos > types.QOS1) { ret false; }
+    # a wildcard or empty publish topic is malformed (MQTT-3.3.2-2): close
+    if (!filter.valid_topic_name(p.publish.topic)) { ret false; }
+
+    mutex.lock(?b.lock);
+    if (p.retain != 0) {
+        if (is_err[bool, str](store_retained(b, p.publish.topic, p.publish.payload.data, p.publish.payload.len, p.qos))) {
+            mutex.unlock(?b.lock);
+            ret false;
+        }
+    }
+    route(b, p.publish.topic, p.publish.payload.data, p.publish.payload.len, p.qos, ?c.scratch);
+    if (p.qos == 1) {
+        var ack: packet.Packet = packet.zero(types.PUBACK);
+        ack.id = p.id;
+        send_fd(c.session.fd, ?ack, ?c.scratch);
+    }
+    mutex.unlock(?b.lock);
+    ret true;
+}
+
+fun upsert_sub(b: *Broker, s: *Session, f: str, qos: u8) Result[bool, str] {
+    var i: usize = 0;
+    for (i < vector.length[Sub](s.subs)) {
+        val sub: *Sub = unwrap_ok[*Sub, str](vector.get[Sub](?s.subs, i));
+        if (str_equals(sub.filter, f)) {
+            sub.qos = qos;
+            ret ok[bool, str](true);
+        }
+        i = i + 1;
+    }
+    val fr: Result[str, str] = heap_str(b, f);
+    if (is_err[str, str](fr)) { ret err[bool, str]("sub filter alloc"); }
+    var ns: Sub;
+    ns.filter = unwrap_ok[str, str](fr);
+    ns.qos    = qos;
+    if (is_err[usize, str](vector.push[Sub](?s.subs, ns))) {
+        free_str(b, ns.filter);
+        ret err[bool, str]("sub push");
+    }
+    ret ok[bool, str](true);
+}
+
+fun handle_subscribe(c: *Conn, p: *packet.Packet) {
+    val b: *Broker = c.broker;
+    mutex.lock(?b.lock);
+
+    var codes: vector.Vector[u8] = vector.init[u8](?c.scratch);
+    var k: usize = 0;
+    for (k < p.filter_count) {
+        val tf: *packet.TopicFilter = ?p.filters[k];
+        k = k + 1;
+        if (!filter.valid_topic_filter(tf.filter)) {
+            vector.push[u8](?codes, types.SUBACK_FAILURE);
+            cnt;
+        }
+        val gq: u8 = min_qos(tf.qos, types.QOS1);
+        if (is_err[bool, str](upsert_sub(b, c.session, tf.filter, gq))) {
+            vector.push[u8](?codes, types.SUBACK_FAILURE);
+            cnt;
+        }
+        vector.push[u8](?codes, gq);
+    }
+
+    var ack: packet.Packet = packet.zero(types.SUBACK);
+    ack.id         = p.id;
+    ack.codes      = codes.data;
+    ack.code_count = codes.len;
+    send_fd(c.session.fd, ?ack, ?c.scratch);
+
+    k = 0;
+    for (k < p.filter_count) {
+        val tf: *packet.TopicFilter = ?p.filters[k];
+        k = k + 1;
+        if (!filter.valid_topic_filter(tf.filter)) { cnt; }
+        deliver_retained(b, c.session, tf.filter, min_qos(tf.qos, types.QOS1), ?c.scratch);
+    }
+
+    vector.dnit[u8](?codes);
+    mutex.unlock(?b.lock);
+}
+
+fun remove_sub(b: *Broker, s: *Session, f: str) {
+    var i: usize = 0;
+    for (i < vector.length[Sub](s.subs)) {
+        val sub: *Sub = unwrap_ok[*Sub, str](vector.get[Sub](?s.subs, i));
+        if (str_equals(sub.filter, f)) {
+            free_str(b, sub.filter);
+            val last: usize = vector.length[Sub](s.subs) - 1;
+            val lp: *Sub = unwrap_ok[*Sub, str](vector.get[Sub](?s.subs, last));
+            @unwrap_ok[*Sub, str](vector.get[Sub](?s.subs, i)) = @lp;
+            vector.pop[Sub](?s.subs);
+            ret;
+        }
+        i = i + 1;
+    }
+}
+
+fun handle_unsubscribe(c: *Conn, p: *packet.Packet) {
+    val b: *Broker = c.broker;
+    mutex.lock(?b.lock);
+    var k: usize = 0;
+    for (k < p.filter_count) {
+        remove_sub(b, c.session, p.filters[k].filter);
+        k = k + 1;
+    }
+    var ack: packet.Packet = packet.zero(types.UNSUBACK);
+    ack.id = p.id;
+    send_fd(c.session.fd, ?ack, ?c.scratch);
+    mutex.unlock(?b.lock);
+}
+
+# create this connection's session, evicting any existing one; lock held
+fun register(b: *Broker, c: *Conn, p: *packet.Packet) {
+    val existing: *Session = find_session(b, p.connect.client_id);
+    if (existing != nil) {
+        var os: tcp.Stream = fd_stream(existing.fd);
+        tcp.stream_shutdown(?os, 2);
+        existing.connected = 0;
+        publish_will(b, existing, ?c.scratch);
+        remove_session_ref(b, existing);
+    }
+
+    val ar: Result[*Session, str] = allocator.allocate[Session](b.heap, 1);
+    if (is_err[*Session, str](ar)) { c.session = nil; ret; }
+    val s: *Session = unwrap_ok[*Session, str](ar);
+
+    val cidr: Result[str, str] = heap_str(b, p.connect.client_id);
+    if (is_err[str, str](cidr)) {
+        allocator.deallocate[Session](b.heap, s, 1);
+        c.session = nil;
+        ret;
+    }
+    s.client_id    = unwrap_ok[str, str](cidr);
+    s.fd           = c.stream.fd;
+    s.connected    = 1;
+    s.clean        = p.connect.clean_session;
+    s.subs         = vector.init[Sub](b.heap);
+    s.next_id      = 0;
+    s.will_flag    = 0;
+    s.will_pending = 0;
+
+    if (p.connect.will_flag != 0) {
+        val wtr: Result[str, str] = heap_str(b, p.connect.will_topic);
+        if (is_err[str, str](wtr)) {
+            free_str(b, s.client_id);
+            vector.dnit[Sub](?s.subs);
+            allocator.deallocate[Session](b.heap, s, 1);
+            c.session = nil;
+            ret;
+        }
+        val wpr: Result[field.Blob, str] = heap_blob(b, p.connect.will_payload.data, p.connect.will_payload.len);
+        if (is_err[field.Blob, str](wpr)) {
+            free_str(b, unwrap_ok[str, str](wtr));
+            free_str(b, s.client_id);
+            vector.dnit[Sub](?s.subs);
+            allocator.deallocate[Session](b.heap, s, 1);
+            c.session = nil;
+            ret;
+        }
+        s.will_flag    = 1;
+        s.will_pending = 1;
+        s.will_qos     = p.connect.will_qos;
+        s.will_retain  = p.connect.will_retain;
+        s.will_topic   = unwrap_ok[str, str](wtr);
+        s.will_payload = unwrap_ok[field.Blob, str](wpr);
+    }
+
+    if (is_err[usize, str](vector.push[*Session](?b.sessions, s))) {
+        if (s.will_flag != 0) {
+            free_str(b, s.will_topic);
+            free_blob(b, s.will_payload);
+        }
+        free_str(b, s.client_id);
+        vector.dnit[Sub](?s.subs);
+        allocator.deallocate[Session](b.heap, s, 1);
+        c.session = nil;
+        ret;
+    }
+    c.session = s;
+}
+
+fun authenticate(c: *Conn, p: *packet.Packet) bool {
+    val b: *Broker = c.broker;
+    if (b.auth_enabled == 0) { ret true; }
+
+    var user: str = nil;
+    if (p.connect.username_flag != 0) { user = p.connect.username; }
+
+    var pass: str = nil;
+    if (p.connect.password_flag != 0) {
+        val n: usize = p.connect.password.len;
+        val ar: Result[*u8, str] = allocator.allocate[u8](?c.arena_a, n + 1);
+        if (is_ok[*u8, str](ar)) {
+            val dst: *u8 = unwrap_ok[*u8, str](ar);
+            if (n > 0) { mem.raw_copy(dst::ptr, p.connect.password.data::ptr, n); }
+            dst[n] = 0;
+            pass = dst::str;
+        }
+    }
+    ret b.auth_fn(user, pass);
+}
+
+fun disconnect(b: *Broker, c: *Conn) {
+    mutex.lock(?b.lock);
+    val s: *Session = c.session;
+    publish_will(b, s, ?c.scratch);
+    if (session_present(b, s)) { remove_session_ref(b, s); }
+    free_session(b, s);
+    mutex.unlock(?b.lock);
+}
+
+# serve one connection to completion, then tear its session down
+# ---
+# b:      the broker
+# stream: the accepted connection (ownership transfers to this call)
+pub fun handle_connection(b: *Broker, stream: tcp.Stream) {
+    var c: Conn;
+    c.broker   = b;
+    c.stream   = stream;
+    c.session  = nil;
+    page.make(?c.scratch);
+    arena.init(?c.ar, ?c.scratch, 4096);
+    arena.make(?c.arena_a, ?c.ar);
+
+    val first: Result[packet.Packet, str] = frame.read_from(?c.stream, ?c.arena_a);
+    if (is_err[packet.Packet, str](first)) { tcp.stream_close(?c.stream); arena.dnit(?c.ar); ret; }
+    var cp: packet.Packet = unwrap_ok[packet.Packet, str](first);
+    if (cp.kind != types.CONNECT) { tcp.stream_close(?c.stream); arena.dnit(?c.ar); ret; }
+
+    if (!authenticate(?c, ?cp)) {
+        var nack: packet.Packet = packet.zero(types.CONNACK);
+        nack.connack.return_code = types.CONNACK_NOT_AUTHORIZED;
+        frame.write_to(?c.stream, ?nack, ?c.scratch);
+        tcp.stream_close(?c.stream);
+        arena.dnit(?c.ar);
+        ret;
+    }
+
+    # empty client ids all alias one identity, so reject them (MQTT-3.1.3-8);
+    # v0.1 requires a non-empty client id regardless of clean_session
+    if (str_len(cp.connect.client_id) == 0) {
+        var rej: packet.Packet = packet.zero(types.CONNACK);
+        rej.connack.return_code = types.CONNACK_IDENTIFIER_REJECTED;
+        frame.write_to(?c.stream, ?rej, ?c.scratch);
+        tcp.stream_close(?c.stream);
+        arena.dnit(?c.ar);
+        ret;
+    }
+
+    mutex.lock(?b.lock);
+    register(b, ?c, ?cp);
+    mutex.unlock(?b.lock);
+    if (c.session == nil) { tcp.stream_close(?c.stream); arena.dnit(?c.ar); ret; }
+
+    var ack: packet.Packet = packet.zero(types.CONNACK);
+    ack.connack.session_present = 0;
+    ack.connack.return_code     = types.CONNACK_ACCEPTED;
+    mutex.lock(?b.lock);
+    send_fd(c.session.fd, ?ack, ?c.scratch);
+    mutex.unlock(?b.lock);
+
+    for {
+        arena.reset(?c.ar);
+        val pr: Result[packet.Packet, str] = frame.read_from(?c.stream, ?c.arena_a);
+        if (is_err[packet.Packet, str](pr)) { brk; }
+        var p: packet.Packet = unwrap_ok[packet.Packet, str](pr);
+
+        if (p.kind == types.PUBLISH) {
+            if (!handle_publish(?c, ?p)) { brk; }
+        }
+        or (p.kind == types.SUBSCRIBE) { handle_subscribe(?c, ?p); }
+        or (p.kind == types.UNSUBSCRIBE) { handle_unsubscribe(?c, ?p); }
+        or (p.kind == types.PINGREQ) {
+            var pong: packet.Packet = packet.zero(types.PINGRESP);
+            mutex.lock(?b.lock);
+            send_fd(c.session.fd, ?pong, ?c.scratch);
+            mutex.unlock(?b.lock);
+        }
+        or (p.kind == types.DISCONNECT) {
+            mutex.lock(?b.lock);
+            c.session.will_pending = 0;
+            mutex.unlock(?b.lock);
+            brk;
+        }
+    }
+
+    disconnect(b, ?c);
+    tcp.stream_close(?c.stream);
+    arena.dnit(?c.ar);
+}

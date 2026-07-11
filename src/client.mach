@@ -1,0 +1,516 @@
+# MQTT 3.1.1 client
+#
+# a synchronous, single-threaded client over one TCP connection: connect with
+# optional will and credentials, publish at QoS 0 or 1, subscribe/unsubscribe,
+# keepalive ping, and blocking message receive. a client instance is not safe to
+# use from multiple threads; use one connection per thread.
+#
+# the client is initialized in place through a *Client out-parameter because its
+# decode arena holds a pointer to itself and must live at a stable address.
+#
+# message ownership: application PUBLISHes that arrive while a control call
+# (subscribe/unsubscribe/QoS 1 publish) is waiting for its ack are acknowledged
+# and buffered in a bounded queue, then handed back in order by next_message
+# rather than dropped. the Message returned by next_message owns its topic and
+# payload in client storage that survives subsequent control calls; it is valid
+# until the following next_message call.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_ok;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use allocator: std.allocator;
+use page:      std.allocator.page;
+use arena:     std.allocator.arena;
+use mem:       std.memory;
+use ip:        std.net.ip;
+use tcp:       std.net.tcp;
+
+use types:  mqtt.packet.types;
+use packet: mqtt.packet.packet;
+use field:  mqtt.packet.field;
+use frame:  mqtt.packet.frame;
+
+# maximum number of application messages buffered across a single control call
+pub val QUEUE_CAP: usize = 32;
+
+# connection options
+# ---
+# client_id:     client identifier
+# clean_session: 1 to request a clean session
+# keepalive:     keepalive interval in seconds (0 disables)
+# will_flag:     1 to register a last-will message
+# will_topic:    will topic (valid when will_flag)
+# will_payload:  will payload (valid when will_flag)
+# will_qos:      will QoS
+# will_retain:   1 to retain the will
+# username_flag: 1 to send a username
+# username:      username (valid when username_flag)
+# password_flag: 1 to send a password
+# password:      password bytes (valid when password_flag)
+pub rec Options {
+    client_id:     str;
+    clean_session: u8;
+    keepalive:     u16;
+    will_flag:     u8;
+    will_topic:    str;
+    will_payload:  field.Blob;
+    will_qos:      u8;
+    will_retain:   u8;
+    username_flag: u8;
+    username:      str;
+    password_flag: u8;
+    password:      field.Blob;
+}
+
+# default options for a clean session with keepalive disabled and no will or auth
+#
+# keepalive defaults to 0 (disabled): a synchronous client cannot send PINGREQ
+# while blocked in next_message, so advertising a nonzero keepalive to a
+# conformant broker would guarantee a disconnect on any idle topic. set keepalive
+# explicitly only if the application drives ping() on its own schedule.
+# ---
+# client_id: client identifier
+# ret:       populated options
+pub fun options(client_id: str) Options {
+    var o: Options;
+    o.client_id     = client_id;
+    o.clean_session = 1;
+    o.keepalive     = 0;
+    o.will_flag     = 0;
+    o.will_topic    = nil;
+    o.will_payload  = field.Blob{data: nil, len: 0};
+    o.will_qos      = 0;
+    o.will_retain   = 0;
+    o.username_flag = 0;
+    o.username      = nil;
+    o.password_flag = 0;
+    o.password      = field.Blob{data: nil, len: 0};
+    ret o;
+}
+
+# a received application message; valid until the next next_message call
+#
+# the topic and payload are owned by the client and survive intervening
+# subscribe/unsubscribe/publish calls.
+# ---
+# topic:       message topic
+# payload:     message bytes (owned by the client until the next next_message)
+# payload_len: payload length
+# qos:         delivered QoS
+# retain:      1 if delivered from the retained store
+pub rec Message {
+    topic:       str;
+    payload:     *u8;
+    payload_len: usize;
+    qos:         u8;
+    retain:      u8;
+}
+
+# a buffered application message with client-owned topic and payload storage
+# ---
+# topic:       owned topic (nil when the slot is empty)
+# payload:     owned payload bytes (nil when empty)
+# payload_len: payload length
+# qos:         delivered QoS
+# retain:      retain flag
+rec Msg {
+    topic:       str;
+    payload:     *u8;
+    payload_len: usize;
+    qos:         u8;
+    retain:      u8;
+}
+
+# a connected client
+# ---
+# stream:    the TCP connection
+# scratch:   page allocator for encode scratch and owned message storage
+# ar:        decode arena
+# arena_a:   allocator view over ar
+# next_id:   outbound packet-identifier counter
+# connected: 1 while the session is live
+# open:      1 while the stream and decode arena are live (guards double-close)
+# queue:     ring of application messages deferred across control calls
+# q_head:    ring read index
+# q_count:   number of queued messages
+# cur:       the message currently borrowed by the caller (owned storage)
+# has_cur:   1 while cur holds a delivered message
+pub rec Client {
+    stream:    tcp.Stream;
+    scratch:   allocator.Allocator;
+    ar:        arena.Arena;
+    arena_a:   allocator.Allocator;
+    next_id:   u16;
+    connected: u8;
+    open:      u8;
+    queue:     [QUEUE_CAP]Msg;
+    q_head:    usize;
+    q_count:   usize;
+    cur:       Msg;
+    has_cur:   u8;
+}
+
+fun next_id(c: *Client) u16 {
+    c.next_id = c.next_id + 1;
+    if (c.next_id == 0) { c.next_id = 1; }
+    ret c.next_id;
+}
+
+fun send(c: *Client, p: *packet.Packet) Result[bool, str] {
+    val r: Result[usize, str] = frame.write_to(?c.stream, p, ?c.scratch);
+    if (is_err[usize, str](r)) { ret err[bool, str](unwrap_err[usize, str](r)); }
+    ret ok[bool, str](true);
+}
+
+fun recv(c: *Client) Result[packet.Packet, str] {
+    arena.reset(?c.ar);
+    ret frame.read_from(?c.stream, ?c.arena_a);
+}
+
+# free a message's owned storage back to the client's page allocator
+fun free_msg(c: *Client, m: *Msg) {
+    if (m.topic != nil) {
+        allocator.deallocate[u8](?c.scratch, m.topic::*u8, str_len(m.topic) + 1);
+        m.topic = nil;
+    }
+    if (m.payload != nil && m.payload_len > 0) {
+        allocator.deallocate[u8](?c.scratch, m.payload, m.payload_len);
+    }
+    m.payload = nil;
+    m.payload_len = 0;
+}
+
+# copy a decoded PUBLISH into owned storage for later delivery
+fun own_msg(c: *Client, p: *packet.Packet, m: *Msg) Result[bool, str] {
+    val tn: usize = str_len(p.publish.topic);
+    val tr: Result[*u8, str] = allocator.allocate[u8](?c.scratch, tn + 1);
+    if (is_err[*u8, str](tr)) { ret err[bool, str]("client: topic alloc"); }
+    val td: *u8 = unwrap_ok[*u8, str](tr);
+    if (tn > 0) { mem.raw_copy(td::ptr, p.publish.topic::ptr, tn); }
+    td[tn] = 0;
+    m.topic = td::str;
+    m.payload = nil;
+    m.payload_len = 0;
+
+    val pl: usize = p.publish.payload.len;
+    if (pl > 0) {
+        val pr: Result[*u8, str] = allocator.allocate[u8](?c.scratch, pl);
+        if (is_err[*u8, str](pr)) {
+            allocator.deallocate[u8](?c.scratch, td, tn + 1);
+            m.topic = nil;
+            ret err[bool, str]("client: payload alloc");
+        }
+        val pd: *u8 = unwrap_ok[*u8, str](pr);
+        mem.raw_copy(pd::ptr, p.publish.payload.data::ptr, pl);
+        m.payload = pd;
+        m.payload_len = pl;
+    }
+    m.qos = p.qos;
+    m.retain = p.retain;
+    ret ok[bool, str](true);
+}
+
+# acknowledge an inbound QoS 1 PUBLISH and enqueue it for next_message
+fun absorb(c: *Client, p: *packet.Packet) Result[bool, str] {
+    if (p.qos == 1) {
+        var ack: packet.Packet = packet.zero(types.PUBACK);
+        ack.id = p.id;
+        send(c, ?ack);
+    }
+    if (c.q_count >= QUEUE_CAP) { ret err[bool, str]("client message queue full"); }
+    val slot: usize = (c.q_head + c.q_count) % QUEUE_CAP;
+    val sr: Result[bool, str] = own_msg(c, p, ?c.queue[slot]);
+    if (is_err[bool, str](sr)) { ret sr; }
+    c.q_count = c.q_count + 1;
+    ret ok[bool, str](true);
+}
+
+# release the borrowed message and drain any queued messages
+fun clear_msgs(c: *Client) {
+    if (c.has_cur != 0) { free_msg(c, ?c.cur); c.has_cur = 0; }
+    for (c.q_count > 0) {
+        free_msg(c, ?c.queue[c.q_head]);
+        c.q_head = (c.q_head + 1) % QUEUE_CAP;
+        c.q_count = c.q_count - 1;
+    }
+}
+
+# close the stream and decode arena exactly once
+fun teardown(c: *Client) {
+    if (c.open == 0) { ret; }
+    tcp.stream_close(?c.stream);
+    arena.dnit(?c.ar);
+    c.open = 0;
+}
+
+fun deliver(c: *Client, out: *Message) {
+    out.topic       = c.cur.topic;
+    out.payload     = c.cur.payload;
+    out.payload_len = c.cur.payload_len;
+    out.qos         = c.cur.qos;
+    out.retain      = c.cur.retain;
+}
+
+# connect to a broker and complete the MQTT handshake
+# ---
+# c:    client to initialize in place
+# ep:   broker endpoint
+# opts: connection options
+# ret:  true on an accepted connection, or an error
+pub fun connect(c: *Client, ep: ip.Endpoint, opts: *Options) Result[bool, str] {
+    val sr: Result[tcp.Stream, str] = tcp.connect(ep);
+    if (is_err[tcp.Stream, str](sr)) { ret err[bool, str](unwrap_err[tcp.Stream, str](sr)); }
+    c.stream    = unwrap_ok[tcp.Stream, str](sr);
+    c.next_id   = 0;
+    c.connected = 0;
+    c.q_head    = 0;
+    c.q_count   = 0;
+    c.has_cur   = 0;
+    page.make(?c.scratch);
+    arena.init(?c.ar, ?c.scratch, 2048);
+    arena.make(?c.arena_a, ?c.ar);
+    c.open      = 1;
+
+    var p: packet.Packet = packet.zero(types.CONNECT);
+    p.connect.clean_session = opts.clean_session;
+    p.connect.keepalive     = opts.keepalive;
+    p.connect.client_id     = opts.client_id;
+    p.connect.will_flag     = opts.will_flag;
+    p.connect.will_qos      = opts.will_qos;
+    p.connect.will_retain   = opts.will_retain;
+    p.connect.will_topic    = opts.will_topic;
+    p.connect.will_payload  = opts.will_payload;
+    p.connect.username_flag  = opts.username_flag;
+    p.connect.username       = opts.username;
+    p.connect.password_flag  = opts.password_flag;
+    p.connect.password       = opts.password;
+
+    val wr: Result[bool, str] = send(c, ?p);
+    if (is_err[bool, str](wr)) { teardown(c); ret wr; }
+
+    val rr: Result[packet.Packet, str] = recv(c);
+    if (is_err[packet.Packet, str](rr)) {
+        teardown(c);
+        ret err[bool, str](unwrap_err[packet.Packet, str](rr));
+    }
+    val ack: packet.Packet = unwrap_ok[packet.Packet, str](rr);
+    if (ack.kind != types.CONNACK) {
+        teardown(c);
+        ret err[bool, str]("expected CONNACK");
+    }
+    if (ack.connack.return_code != types.CONNACK_ACCEPTED) {
+        teardown(c);
+        ret err[bool, str]("connection refused");
+    }
+    c.connected = 1;
+    ret ok[bool, str](true);
+}
+
+# publish a message
+#
+# QoS 0 sends and returns immediately; QoS 1 sends and blocks until the matching
+# PUBACK is received, buffering any application messages that arrive meanwhile.
+# QoS 2 is not supported and is rejected.
+# ---
+# c:      client
+# topic:  topic name
+# data:   payload bytes (may be nil when len is 0)
+# len:    payload length
+# qos:    QoS level (0 or 1)
+# retain: 1 to retain the message
+# ret:    true on success, or an error
+pub fun publish(c: *Client, topic: str, data: *u8, len: usize, qos: u8, retain: u8) Result[bool, str] {
+    if (qos > types.QOS1) { ret err[bool, str]("qos 2 not supported"); }
+
+    var p: packet.Packet = packet.zero(types.PUBLISH);
+    p.qos    = qos;
+    p.retain = retain;
+    p.publish.topic   = topic;
+    p.publish.payload = field.Blob{data: data, len: len};
+    if (qos > 0) { p.id = next_id(c); }
+
+    val wr: Result[bool, str] = send(c, ?p);
+    if (is_err[bool, str](wr)) { ret wr; }
+    if (qos == 0) { ret ok[bool, str](true); }
+
+    val want: u16 = p.id;
+    for {
+        val rr: Result[packet.Packet, str] = recv(c);
+        if (is_err[packet.Packet, str](rr)) { ret err[bool, str](unwrap_err[packet.Packet, str](rr)); }
+        val ack: packet.Packet = unwrap_ok[packet.Packet, str](rr);
+        if (ack.kind == types.PUBACK && ack.id == want) { ret ok[bool, str](true); }
+        or (ack.kind == types.PUBLISH) {
+            val abr: Result[bool, str] = absorb(c, ?ack);
+            if (is_err[bool, str](abr)) { ret abr; }
+        }
+    }
+    ret ok[bool, str](true);
+}
+
+# subscribe to a single topic filter and wait for the SUBACK
+#
+# a requested QoS above 1 is capped at 1 (QoS 2 is out of scope).
+# ---
+# c:      client
+# filter: topic filter (may contain + and # wildcards)
+# qos:    requested maximum QoS
+# ret:    granted QoS code (0x80 on failure), or an error
+pub fun subscribe(c: *Client, filter: str, qos: u8) Result[u8, str] {
+    var rq: u8 = qos;
+    if (rq > types.QOS1) { rq = types.QOS1; }
+
+    var tf: packet.TopicFilter;
+    tf.filter = filter;
+    tf.qos    = rq;
+
+    var p: packet.Packet = packet.zero(types.SUBSCRIBE);
+    p.id           = next_id(c);
+    p.filters      = ?tf;
+    p.filter_count = 1;
+
+    val wr: Result[bool, str] = send(c, ?p);
+    if (is_err[bool, str](wr)) { ret err[u8, str](unwrap_err[bool, str](wr)); }
+
+    val want: u16 = p.id;
+    for {
+        val rr: Result[packet.Packet, str] = recv(c);
+        if (is_err[packet.Packet, str](rr)) { ret err[u8, str](unwrap_err[packet.Packet, str](rr)); }
+        val ack: packet.Packet = unwrap_ok[packet.Packet, str](rr);
+        if (ack.kind == types.SUBACK && ack.id == want) {
+            if (ack.code_count == 0) { ret err[u8, str]("empty SUBACK"); }
+            ret ok[u8, str](ack.codes[0]);
+        }
+        or (ack.kind == types.PUBLISH) {
+            val abr: Result[bool, str] = absorb(c, ?ack);
+            if (is_err[bool, str](abr)) { ret err[u8, str](unwrap_err[bool, str](abr)); }
+        }
+    }
+    ret err[u8, str]("no SUBACK");
+}
+
+# unsubscribe from a single topic filter and wait for the UNSUBACK
+# ---
+# c:      client
+# filter: topic filter to remove
+# ret:    true on success, or an error
+pub fun unsubscribe(c: *Client, filter: str) Result[bool, str] {
+    var tf: packet.TopicFilter;
+    tf.filter = filter;
+    tf.qos    = 0;
+
+    var p: packet.Packet = packet.zero(types.UNSUBSCRIBE);
+    p.id           = next_id(c);
+    p.filters      = ?tf;
+    p.filter_count = 1;
+
+    val wr: Result[bool, str] = send(c, ?p);
+    if (is_err[bool, str](wr)) { ret wr; }
+
+    val want: u16 = p.id;
+    for {
+        val rr: Result[packet.Packet, str] = recv(c);
+        if (is_err[packet.Packet, str](rr)) { ret err[bool, str](unwrap_err[packet.Packet, str](rr)); }
+        val ack: packet.Packet = unwrap_ok[packet.Packet, str](rr);
+        if (ack.kind == types.UNSUBACK && ack.id == want) { ret ok[bool, str](true); }
+        or (ack.kind == types.PUBLISH) {
+            val abr: Result[bool, str] = absorb(c, ?ack);
+            if (is_err[bool, str](abr)) { ret abr; }
+        }
+    }
+    ret ok[bool, str](true);
+}
+
+# block until the next application message arrives
+#
+# returns messages buffered during earlier control calls first, then reads from
+# the connection. acknowledges inbound QoS 1 messages automatically and skips
+# broker control packets. the returned message is owned by the client and stays
+# valid until the next next_message call.
+# ---
+# c:   client
+# out: message to fill
+# ret: true on a delivered message, or an error (including a peer close)
+pub fun next_message(c: *Client, out: *Message) Result[bool, str] {
+    if (c.has_cur != 0) { free_msg(c, ?c.cur); c.has_cur = 0; }
+
+    if (c.q_count > 0) {
+        c.cur = c.queue[c.q_head];
+        c.q_head = (c.q_head + 1) % QUEUE_CAP;
+        c.q_count = c.q_count - 1;
+        c.has_cur = 1;
+        deliver(c, out);
+        ret ok[bool, str](true);
+    }
+
+    for {
+        val rr: Result[packet.Packet, str] = recv(c);
+        if (is_err[packet.Packet, str](rr)) { ret err[bool, str](unwrap_err[packet.Packet, str](rr)); }
+        val p: packet.Packet = unwrap_ok[packet.Packet, str](rr);
+
+        if (p.kind == types.PUBLISH) {
+            if (p.qos == 1) {
+                var ack: packet.Packet = packet.zero(types.PUBACK);
+                ack.id = p.id;
+                send(c, ?ack);
+            }
+            val mr: Result[bool, str] = own_msg(c, ?p, ?c.cur);
+            if (is_err[bool, str](mr)) { ret err[bool, str](unwrap_err[bool, str](mr)); }
+            c.has_cur = 1;
+            deliver(c, out);
+            ret ok[bool, str](true);
+        }
+        or (p.kind == types.DISCONNECT) {
+            ret err[bool, str]("disconnected");
+        }
+    }
+    ret ok[bool, str](true);
+}
+
+# send a keepalive PINGREQ (does not wait for PINGRESP)
+# ---
+# c:   client
+# ret: true on success, or an error
+pub fun ping(c: *Client) Result[bool, str] {
+    var p: packet.Packet = packet.zero(types.PINGREQ);
+    ret send(c, ?p);
+}
+
+# send DISCONNECT and close the connection
+# ---
+# c: client
+pub fun disconnect(c: *Client) {
+    if (c.connected != 0) {
+        var p: packet.Packet = packet.zero(types.DISCONNECT);
+        send(c, ?p);
+    }
+    clear_msgs(c);
+    teardown(c);
+    c.connected = 0;
+}
+
+# close the connection without sending DISCONNECT (used to trigger a will)
+# ---
+# c: client
+pub fun close(c: *Client) {
+    clear_msgs(c);
+    teardown(c);
+    c.connected = 0;
+}
+
+test "client: publish rejects qos 2" {
+    var c: Client;
+    val r: Result[bool, str] = publish(?c, "t", nil, 0, 2, 0);
+    if (is_ok[bool, str](r)) { ret 1; }
+    ret 0;
+}

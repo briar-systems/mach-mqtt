@@ -1,0 +1,192 @@
+# MQTT topic name and filter matching
+#
+# implements the 3.1.1 topic matching rules: '/' separates levels, '+' matches
+# exactly one level, '#' matches the remaining levels (including none) and must
+# be the last level. a leading '$' topic is not matched by a wildcard occupying
+# the first level.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+# index of the '/' ending the level at start, or the index of the terminator
+fun level_end(s: str, start: usize) usize {
+    var i: usize = start;
+    for (s[i] != 0 && s[i] != '/') { i = i + 1; }
+    ret i;
+}
+
+# check whether a topic name is valid for publishing (no wildcards, non-empty)
+# ---
+# t:   topic name
+# ret: true if the name is a legal publish topic
+pub fun valid_topic_name(t: str) bool {
+    if (t == nil) { ret false; }
+    val n: usize = str_len(t);
+    if (n == 0 || n > 65535) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (t[i] == '+' || t[i] == '#') { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# check whether a topic filter is well-formed for subscribing
+# ---
+# f:   topic filter (may contain + and # wildcards)
+# ret: true if the filter obeys the wildcard placement rules
+pub fun valid_topic_filter(f: str) bool {
+    if (f == nil) { ret false; }
+    val n: usize = str_len(f);
+    if (n == 0 || n > 65535) { ret false; }
+
+    var i: usize = 0;
+    var level_start: usize = 0;
+    for {
+        val at_sep: bool = f[i] == '/' || f[i] == 0;
+        if (at_sep) {
+            val len: usize = i - level_start;
+            var j: usize = level_start;
+            for (j < i) {
+                val c: u8 = f[j];
+                if (c == '#') {
+                    if (len != 1) { ret false; }
+                    if (f[i] != 0) { ret false; }
+                }
+                or (c == '+') {
+                    if (len != 1) { ret false; }
+                }
+                j = j + 1;
+            }
+            if (f[i] == 0) { brk; }
+            level_start = i + 1;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# check whether a topic filter matches a concrete topic name
+# ---
+# filter: topic filter (may contain + and # wildcards)
+# topic:  concrete topic name
+# ret:    true if the filter matches the topic
+pub fun matches(filter: str, topic: str) bool {
+    if (filter == nil || topic == nil) { ret false; }
+
+    var fi:    usize = 0;
+    var ti:    usize = 0;
+    var first: bool  = true;
+
+    for {
+        if (filter[fi] == '#') {
+            if (first && topic[ti] == '$') { ret false; }
+            ret true;
+        }
+
+        val fe:   usize = level_end(filter, fi);
+        val te:   usize = level_end(topic, ti);
+        val flen: usize = fe - fi;
+        val tlen: usize = te - ti;
+
+        if (flen == 1 && filter[fi] == '+') {
+            if (first && topic[ti] == '$') { ret false; }
+        }
+        or {
+            if (flen != tlen) { ret false; }
+            var k: usize = 0;
+            for (k < flen) {
+                if (filter[fi + k] != topic[ti + k]) { ret false; }
+                k = k + 1;
+            }
+        }
+
+        first = false;
+
+        val f_more: bool = filter[fe] == '/';
+        val t_more: bool = topic[te] == '/';
+
+        if (!f_more && !t_more) { ret true; }
+        if (!f_more && t_more) { ret false; }
+        if (f_more && !t_more) {
+            if (filter[fe + 1] == '#' && filter[fe + 2] == 0) { ret true; }
+            ret false;
+        }
+
+        fi = fe + 1;
+        ti = te + 1;
+    }
+    ret false;
+}
+
+test "filter: exact match" {
+    if (!matches("a/b/c", "a/b/c")) { ret 1; }
+    if (matches("a/b/c", "a/b/d")) { ret 1; }
+    if (matches("a/b", "a/b/c")) { ret 1; }
+    if (matches("a/b/c", "a/b")) { ret 1; }
+    ret 0;
+}
+
+test "filter: plus single level" {
+    if (!matches("a/+/c", "a/b/c")) { ret 1; }
+    if (!matches("a/+/c", "a/z/c")) { ret 1; }
+    if (matches("a/+/c", "a/b/d")) { ret 1; }
+    if (matches("a/+/c", "a/b/b/c")) { ret 1; }
+    if (!matches("+", "a")) { ret 1; }
+    if (matches("+", "a/b")) { ret 1; }
+    if (!matches("+/+", "a/b")) { ret 1; }
+    ret 0;
+}
+
+test "filter: plus matches empty level" {
+    if (!matches("a/+/c", "a//c")) { ret 1; }
+    ret 0;
+}
+
+test "filter: hash multi level" {
+    if (!matches("#", "a")) { ret 1; }
+    if (!matches("#", "a/b/c")) { ret 1; }
+    if (!matches("sport/#", "sport")) { ret 1; }
+    if (!matches("sport/#", "sport/tennis")) { ret 1; }
+    if (!matches("sport/#", "sport/tennis/player1")) { ret 1; }
+    if (matches("sport/#", "other")) { ret 1; }
+    ret 0;
+}
+
+test "filter: hash requires level boundary" {
+    if (matches("sport/+", "sport")) { ret 1; }
+    if (!matches("sport/+", "sport/tennis")) { ret 1; }
+    ret 0;
+}
+
+test "filter: dollar topics excluded from leading wildcard" {
+    if (matches("#", "$SYS/broker/uptime")) { ret 1; }
+    if (matches("+/broker/uptime", "$SYS/broker/uptime")) { ret 1; }
+    if (!matches("$SYS/#", "$SYS/broker/uptime")) { ret 1; }
+    ret 0;
+}
+
+test "filter: valid_topic_name" {
+    if (!valid_topic_name("a/b/c")) { ret 1; }
+    if (valid_topic_name("a/+/c")) { ret 1; }
+    if (valid_topic_name("a/#")) { ret 1; }
+    if (valid_topic_name("")) { ret 1; }
+    ret 0;
+}
+
+test "filter: valid_topic_filter" {
+    if (!valid_topic_filter("a/b/c")) { ret 1; }
+    if (!valid_topic_filter("a/+/c")) { ret 1; }
+    if (!valid_topic_filter("sport/#")) { ret 1; }
+    if (!valid_topic_filter("#")) { ret 1; }
+    if (!valid_topic_filter("+")) { ret 1; }
+    if (valid_topic_filter("sport/#/x")) { ret 1; }
+    if (valid_topic_filter("sport+")) { ret 1; }
+    if (valid_topic_filter("sp#ort")) { ret 1; }
+    if (valid_topic_filter("")) { ret 1; }
+    ret 0;
+}

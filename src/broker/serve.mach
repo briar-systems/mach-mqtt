@@ -1,0 +1,116 @@
+# broker accept loop
+#
+# accepts connections on a listener and serves each on its own OS thread. the
+# std thread API takes a bare function with no user argument, so each accepted
+# connection is handed to its thread through a mutex-guarded slot with an atomic
+# handshake: the spawning loop blocks until the new thread has copied the slot,
+# guaranteeing exactly one connection per thread. finished threads are joined and
+# their contexts reclaimed on subsequent accepts.
+
+use std.types.size.usize;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.string.str;
+
+use allocator: std.allocator;
+use page:      std.allocator.page;
+use vector:    std.collections.vector;
+use mutex:     std.sync.mutex;
+use atomic:    std.sync.atomic;
+use thread:    std.sync.thread;
+use tcp:       std.net.tcp;
+use log:       std.log;
+
+use core: mqtt.broker.core;
+
+# per-connection thread context handed across the accept handshake
+# ---
+# broker: broker serving the connection
+# stream: the accepted connection
+# thread: the serving thread's handle (stable heap address for its lifetime)
+rec ConnCtx {
+    broker: *core.Broker;
+    stream: tcp.Stream;
+    thread: thread.Thread;
+}
+
+var g_accept_lock: mutex.Mutex;
+var g_handoff:     usize = 0;
+var g_ready:       i64 = 0;
+
+fun conn_entry() {
+    val ctx: *ConnCtx = g_handoff::*ConnCtx;
+    atomic.store(?g_ready, 0);
+    core.handle_connection(ctx.broker, ctx.stream);
+}
+
+fun reap(conns: *vector.Vector[*ConnCtx], pa: *allocator.Allocator) {
+    var i: usize = 0;
+    for (i < vector.length[*ConnCtx](@conns)) {
+        val ctx: *ConnCtx = @unwrap_ok[**ConnCtx, str](vector.get[*ConnCtx](conns, i));
+        if (thread.is_done(?ctx.thread)) {
+            thread.join(?ctx.thread);
+            val last: usize = vector.length[*ConnCtx](@conns) - 1;
+            val lp: *ConnCtx = @unwrap_ok[**ConnCtx, str](vector.get[*ConnCtx](conns, last));
+            @unwrap_ok[**ConnCtx, str](vector.get[*ConnCtx](conns, i)) = lp;
+            vector.pop[*ConnCtx](conns);
+            allocator.deallocate[ConnCtx](pa, ctx, 1);
+        }
+        or {
+            i = i + 1;
+        }
+    }
+}
+
+# accept and serve connections until the listener fails
+#
+# blocks the calling thread. spawns one serving thread per accepted connection.
+# ---
+# b:  the broker
+# ln: a bound, listening TCP listener
+pub fun serve(b: *core.Broker, ln: *tcp.Listener) {
+    g_accept_lock = mutex.make();
+
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    var conns: vector.Vector[*ConnCtx] = vector.init[*ConnCtx](?pa);
+
+    for {
+        reap(?conns, ?pa);
+
+        val ar: Result[tcp.Stream, str] = tcp.accept(ln);
+        if (is_err[tcp.Stream, str](ar)) { brk; }
+        val stream: tcp.Stream = unwrap_ok[tcp.Stream, str](ar);
+
+        val ca: Result[*ConnCtx, str] = allocator.allocate[ConnCtx](?pa, 1);
+        if (is_err[*ConnCtx, str](ca)) {
+            var s: tcp.Stream = stream;
+            tcp.stream_close(?s);
+            cnt;
+        }
+        val ctx: *ConnCtx = unwrap_ok[*ConnCtx, str](ca);
+        ctx.broker = b;
+        ctx.stream = stream;
+
+        mutex.lock(?g_accept_lock);
+        g_handoff = ctx::usize;
+        atomic.store(?g_ready, 1);
+        thread.spawn(conn_entry, ?ctx.thread);
+        if (ctx.thread.tid < 0) {
+            atomic.store(?g_ready, 0);
+            mutex.unlock(?g_accept_lock);
+            var s: tcp.Stream = ctx.stream;
+            tcp.stream_close(?s);
+            allocator.deallocate[ConnCtx](?pa, ctx, 1);
+            log.error("broker: thread spawn failed");
+            cnt;
+        }
+        for (atomic.load(?g_ready) == 1) { atomic.spin_hint(); }
+        mutex.unlock(?g_accept_lock);
+
+        vector.push[*ConnCtx](?conns, ctx);
+    }
+
+    vector.dnit[*ConnCtx](?conns);
+}
