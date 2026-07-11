@@ -1,8 +1,56 @@
 use std.runtime;
-use print: std.print;
+
+use std.types.result.Result;
+use std.types.result.is_ok;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.string.str;
+
+use print:     std.print;
+use log:       std.log;
+use parse:     std.text.parse;
+use allocator: std.allocator;
+use page:      std.allocator.page;
+use ip:        std.net.ip;
+use tcp:       std.net.tcp;
+
+use core:  mqtt.broker.core;
+use serve: mqtt.broker.serve;
+
+val DEFAULT_PORT: u16 = 1883;
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
-    print.println("brokerd: not yet implemented");
+    var port: u16 = DEFAULT_PORT;
+    if (argc > 1) {
+        val a1: str = argv[1]::str;
+        val pr: Result[u64, str] = parse.parse_u64_exact(a1, 10);
+        if (is_err[u64, str](pr)) {
+            print.eprintln("usage: brokerd [port]");
+            ret 1;
+        }
+        port = unwrap_ok[u64, str](pr)::u16;
+    }
+
+    log.set_level(log.INFO);
+
+    var heap: allocator.Allocator;
+    page.make(?heap);
+
+    var b: core.Broker;
+    core.init(?b, ?heap);
+
+    val ep: ip.Endpoint = ip.endpoint(0, 0, 0, 0, port);
+    val lr: Result[tcp.Listener, str] = tcp.listen(ep, 128);
+    if (is_err[tcp.Listener, str](lr)) {
+        log.error("brokerd: bind failed");
+        ret 1;
+    }
+    var ln: tcp.Listener = unwrap_ok[tcp.Listener, str](lr);
+
+    print.printlnf("brokerd: listening on 0.0.0.0:{}", port::u64);
+    serve.serve(?b, ?ln);
+
+    tcp.listener_close(?ln);
     ret 0;
 }
