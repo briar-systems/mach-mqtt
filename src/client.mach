@@ -1,0 +1,342 @@
+# MQTT 3.1.1 client
+#
+# a synchronous, single-threaded client over one TCP connection: connect with
+# optional will and credentials, publish at QoS 0 or 1, subscribe/unsubscribe,
+# keepalive ping, and blocking message receive. a client instance is not safe to
+# use from multiple threads; use one connection per thread.
+#
+# the client is initialized in place through a *Client out-parameter because its
+# decode arena holds a pointer to itself and must live at a stable address.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use allocator: std.allocator;
+use page:      std.allocator.page;
+use arena:     std.allocator.arena;
+use ip:        std.net.ip;
+use tcp:       std.net.tcp;
+
+use types:  mqtt.packet.types;
+use packet: mqtt.packet.packet;
+use field:  mqtt.packet.field;
+use frame:  mqtt.packet.frame;
+
+# connection options
+# ---
+# client_id:     client identifier
+# clean_session: 1 to request a clean session
+# keepalive:     keepalive interval in seconds (0 disables)
+# will_flag:     1 to register a last-will message
+# will_topic:    will topic (valid when will_flag)
+# will_payload:  will payload (valid when will_flag)
+# will_qos:      will QoS
+# will_retain:   1 to retain the will
+# username_flag: 1 to send a username
+# username:      username (valid when username_flag)
+# password_flag: 1 to send a password
+# password:      password bytes (valid when password_flag)
+pub rec Options {
+    client_id:     str;
+    clean_session: u8;
+    keepalive:     u16;
+    will_flag:     u8;
+    will_topic:    str;
+    will_payload:  field.Blob;
+    will_qos:      u8;
+    will_retain:   u8;
+    username_flag: u8;
+    username:      str;
+    password_flag: u8;
+    password:      field.Blob;
+}
+
+# default options for a clean session with a 60s keepalive and no will or auth
+# ---
+# client_id: client identifier
+# ret:       populated options
+pub fun options(client_id: str) Options {
+    var o: Options;
+    o.client_id     = client_id;
+    o.clean_session = 1;
+    o.keepalive     = 60;
+    o.will_flag     = 0;
+    o.will_topic    = nil;
+    o.will_payload  = field.Blob{data: nil, len: 0};
+    o.will_qos      = 0;
+    o.will_retain   = 0;
+    o.username_flag = 0;
+    o.username      = nil;
+    o.password_flag = 0;
+    o.password      = field.Blob{data: nil, len: 0};
+    ret o;
+}
+
+# a received application message; valid until the next receive call
+# ---
+# topic:       message topic
+# payload:     message bytes (borrowed from the client's decode arena)
+# payload_len: payload length
+# qos:         delivered QoS
+# retain:      1 if delivered from the retained store
+pub rec Message {
+    topic:       str;
+    payload:     *u8;
+    payload_len: usize;
+    qos:         u8;
+    retain:      u8;
+}
+
+# a connected client
+# ---
+# stream:    the TCP connection
+# scratch:   page allocator for encode scratch buffers
+# ar:        decode arena
+# arena_a:   allocator view over ar
+# next_id:   outbound packet-identifier counter
+# connected: 1 while the session is live
+pub rec Client {
+    stream:    tcp.Stream;
+    scratch:   allocator.Allocator;
+    ar:        arena.Arena;
+    arena_a:   allocator.Allocator;
+    next_id:   u16;
+    connected: u8;
+}
+
+fun next_id(c: *Client) u16 {
+    c.next_id = c.next_id + 1;
+    if (c.next_id == 0) { c.next_id = 1; }
+    ret c.next_id;
+}
+
+fun send(c: *Client, p: *packet.Packet) Result[bool, str] {
+    val r: Result[usize, str] = frame.write_to(?c.stream, p, ?c.scratch);
+    if (is_err[usize, str](r)) { ret err[bool, str](unwrap_err[usize, str](r)); }
+    ret ok[bool, str](true);
+}
+
+fun recv(c: *Client) Result[packet.Packet, str] {
+    arena.reset(?c.ar);
+    ret frame.read_from(?c.stream, ?c.arena_a);
+}
+
+# connect to a broker and complete the MQTT handshake
+# ---
+# c:    client to initialize in place
+# ep:   broker endpoint
+# opts: connection options
+# ret:  true on an accepted connection, or an error
+pub fun connect(c: *Client, ep: ip.Endpoint, opts: *Options) Result[bool, str] {
+    val sr: Result[tcp.Stream, str] = tcp.connect(ep);
+    if (is_err[tcp.Stream, str](sr)) { ret err[bool, str](unwrap_err[tcp.Stream, str](sr)); }
+    c.stream    = unwrap_ok[tcp.Stream, str](sr);
+    c.next_id   = 0;
+    c.connected = 0;
+    page.make(?c.scratch);
+    arena.init(?c.ar, ?c.scratch, 2048);
+    arena.make(?c.arena_a, ?c.ar);
+
+    var p: packet.Packet = packet.zero(types.CONNECT);
+    p.connect.clean_session = opts.clean_session;
+    p.connect.keepalive     = opts.keepalive;
+    p.connect.client_id     = opts.client_id;
+    p.connect.will_flag     = opts.will_flag;
+    p.connect.will_qos      = opts.will_qos;
+    p.connect.will_retain   = opts.will_retain;
+    p.connect.will_topic    = opts.will_topic;
+    p.connect.will_payload  = opts.will_payload;
+    p.connect.username_flag  = opts.username_flag;
+    p.connect.username       = opts.username;
+    p.connect.password_flag  = opts.password_flag;
+    p.connect.password       = opts.password;
+
+    val wr: Result[bool, str] = send(c, ?p);
+    if (is_err[bool, str](wr)) { tcp.stream_close(?c.stream); arena.dnit(?c.ar); ret wr; }
+
+    val rr: Result[packet.Packet, str] = recv(c);
+    if (is_err[packet.Packet, str](rr)) {
+        tcp.stream_close(?c.stream); arena.dnit(?c.ar);
+        ret err[bool, str](unwrap_err[packet.Packet, str](rr));
+    }
+    val ack: packet.Packet = unwrap_ok[packet.Packet, str](rr);
+    if (ack.kind != types.CONNACK) {
+        tcp.stream_close(?c.stream); arena.dnit(?c.ar);
+        ret err[bool, str]("expected CONNACK");
+    }
+    if (ack.connack.return_code != types.CONNACK_ACCEPTED) {
+        tcp.stream_close(?c.stream); arena.dnit(?c.ar);
+        ret err[bool, str]("connection refused");
+    }
+    c.connected = 1;
+    ret ok[bool, str](true);
+}
+
+# publish a message
+#
+# QoS 0 sends and returns immediately; QoS 1 sends and blocks until the matching
+# PUBACK is received. do not mix QoS 1 publishing with receive on the same client.
+# ---
+# c:      client
+# topic:  topic name
+# data:   payload bytes (may be nil when len is 0)
+# len:    payload length
+# qos:    QoS level (0 or 1)
+# retain: 1 to retain the message
+# ret:    true on success, or an error
+pub fun publish(c: *Client, topic: str, data: *u8, len: usize, qos: u8, retain: u8) Result[bool, str] {
+    var p: packet.Packet = packet.zero(types.PUBLISH);
+    p.qos    = qos;
+    p.retain = retain;
+    p.publish.topic   = topic;
+    p.publish.payload = field.Blob{data: data, len: len};
+    if (qos > 0) { p.id = next_id(c); }
+
+    val wr: Result[bool, str] = send(c, ?p);
+    if (is_err[bool, str](wr)) { ret wr; }
+    if (qos == 0) { ret ok[bool, str](true); }
+
+    val want: u16 = p.id;
+    for {
+        val rr: Result[packet.Packet, str] = recv(c);
+        if (is_err[packet.Packet, str](rr)) { ret err[bool, str](unwrap_err[packet.Packet, str](rr)); }
+        val ack: packet.Packet = unwrap_ok[packet.Packet, str](rr);
+        if (ack.kind == types.PUBACK && ack.id == want) { ret ok[bool, str](true); }
+    }
+    ret ok[bool, str](true);
+}
+
+# subscribe to a single topic filter and wait for the SUBACK
+# ---
+# c:      client
+# filter: topic filter (may contain + and # wildcards)
+# qos:    requested maximum QoS
+# ret:    granted QoS code (0x80 on failure), or an error
+pub fun subscribe(c: *Client, filter: str, qos: u8) Result[u8, str] {
+    var tf: packet.TopicFilter;
+    tf.filter = filter;
+    tf.qos    = qos;
+
+    var p: packet.Packet = packet.zero(types.SUBSCRIBE);
+    p.id           = next_id(c);
+    p.filters      = ?tf;
+    p.filter_count = 1;
+
+    val wr: Result[bool, str] = send(c, ?p);
+    if (is_err[bool, str](wr)) { ret err[u8, str](unwrap_err[bool, str](wr)); }
+
+    val want: u16 = p.id;
+    for {
+        val rr: Result[packet.Packet, str] = recv(c);
+        if (is_err[packet.Packet, str](rr)) { ret err[u8, str](unwrap_err[packet.Packet, str](rr)); }
+        val ack: packet.Packet = unwrap_ok[packet.Packet, str](rr);
+        if (ack.kind == types.SUBACK && ack.id == want) {
+            if (ack.code_count == 0) { ret err[u8, str]("empty SUBACK"); }
+            ret ok[u8, str](ack.codes[0]);
+        }
+    }
+    ret err[u8, str]("no SUBACK");
+}
+
+# unsubscribe from a single topic filter and wait for the UNSUBACK
+# ---
+# c:      client
+# filter: topic filter to remove
+# ret:    true on success, or an error
+pub fun unsubscribe(c: *Client, filter: str) Result[bool, str] {
+    var tf: packet.TopicFilter;
+    tf.filter = filter;
+    tf.qos    = 0;
+
+    var p: packet.Packet = packet.zero(types.UNSUBSCRIBE);
+    p.id           = next_id(c);
+    p.filters      = ?tf;
+    p.filter_count = 1;
+
+    val wr: Result[bool, str] = send(c, ?p);
+    if (is_err[bool, str](wr)) { ret wr; }
+
+    val want: u16 = p.id;
+    for {
+        val rr: Result[packet.Packet, str] = recv(c);
+        if (is_err[packet.Packet, str](rr)) { ret err[bool, str](unwrap_err[packet.Packet, str](rr)); }
+        val ack: packet.Packet = unwrap_ok[packet.Packet, str](rr);
+        if (ack.kind == types.UNSUBACK && ack.id == want) { ret ok[bool, str](true); }
+    }
+    ret ok[bool, str](true);
+}
+
+# block until the next application message arrives
+#
+# acknowledges inbound QoS 1 messages automatically and skips broker control
+# packets. the returned message borrows the client's decode arena and is valid
+# only until the next receive call.
+# ---
+# c:   client
+# out: message to fill
+# ret: true on a delivered message, or an error (including a peer close)
+pub fun next_message(c: *Client, out: *Message) Result[bool, str] {
+    for {
+        val rr: Result[packet.Packet, str] = recv(c);
+        if (is_err[packet.Packet, str](rr)) { ret err[bool, str](unwrap_err[packet.Packet, str](rr)); }
+        val p: packet.Packet = unwrap_ok[packet.Packet, str](rr);
+
+        if (p.kind == types.PUBLISH) {
+            if (p.qos == 1) {
+                var ack: packet.Packet = packet.zero(types.PUBACK);
+                ack.id = p.id;
+                send(c, ?ack);
+            }
+            out.topic       = p.publish.topic;
+            out.payload     = p.publish.payload.data;
+            out.payload_len = p.publish.payload.len;
+            out.qos         = p.qos;
+            out.retain      = p.retain;
+            ret ok[bool, str](true);
+        }
+        or (p.kind == types.DISCONNECT) {
+            ret err[bool, str]("disconnected");
+        }
+    }
+    ret ok[bool, str](true);
+}
+
+# send a keepalive PINGREQ (does not wait for PINGRESP)
+# ---
+# c:   client
+# ret: true on success, or an error
+pub fun ping(c: *Client) Result[bool, str] {
+    var p: packet.Packet = packet.zero(types.PINGREQ);
+    ret send(c, ?p);
+}
+
+# send DISCONNECT and close the connection
+# ---
+# c: client
+pub fun disconnect(c: *Client) {
+    if (c.connected != 0) {
+        var p: packet.Packet = packet.zero(types.DISCONNECT);
+        send(c, ?p);
+    }
+    tcp.stream_close(?c.stream);
+    arena.dnit(?c.ar);
+    c.connected = 0;
+}
+
+# close the connection without sending DISCONNECT (used to trigger a will)
+# ---
+# c: client
+pub fun close(c: *Client) {
+    tcp.stream_close(?c.stream);
+    arena.dnit(?c.ar);
+    c.connected = 0;
+}

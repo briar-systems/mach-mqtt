@@ -1,0 +1,124 @@
+# in-process end-to-end tests
+#
+# runs the broker on a background thread bound to loopback and drives it with the
+# client library, exercising the full connect/subscribe/publish/receive path
+# including wildcard routing, retained delivery, and last-will dispatch.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.result.Result;
+use std.types.result.is_ok;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+
+use allocator: std.allocator;
+use page:      std.allocator.page;
+use ip:        std.net.ip;
+use tcp:       std.net.tcp;
+use thread:    std.sync.thread;
+use mem:       std.memory;
+
+use client: mqtt.client;
+use core:   mqtt.broker.core;
+use serve:  mqtt.broker.serve;
+use field:  mqtt.packet.field;
+
+var g_heap:     allocator.Allocator;
+var g_broker:   core.Broker;
+var g_listener: tcp.Listener;
+
+fun serve_entry() {
+    serve.serve(?g_broker, ?g_listener);
+}
+
+fun payload_is(m: *client.Message, expect: str) bool {
+    var i: usize = 0;
+    for (expect[i] != 0) { i = i + 1; }
+    if (m.payload_len != i) { ret false; }
+    if (i == 0) { ret true; }
+    ret mem.raw_equal(m.payload::ptr, expect::ptr, i);
+}
+
+test "e2e: pub/sub, retained, and will through the broker" {
+    page.make(?g_heap);
+    core.init(?g_broker, ?g_heap);
+
+    val ep: ip.Endpoint = ip.endpoint(127, 0, 0, 1, 17653);
+    val lr: Result[tcp.Listener, str] = tcp.listen(ep, 16);
+    if (is_err[tcp.Listener, str](lr)) { ret 1; }
+    g_listener = unwrap_ok[tcp.Listener, str](lr);
+
+    var th: thread.Thread;
+    thread.spawn(serve_entry, ?th);
+    if (th.tid < 0) { ret 1; }
+
+    # subscriber
+    var sub_opts: client.Options = client.options("e2e-sub");
+    var csub: client.Client;
+    if (is_err[bool, str](client.connect(?csub, ep, ?sub_opts))) { ret 2; }
+    val g: Result[u8, str] = client.subscribe(?csub, "e2e/+/v", 1);
+    if (is_err[u8, str](g)) { ret 3; }
+    if (unwrap_ok[u8, str](g) != 1) { ret 4; }
+
+    # publisher
+    var pub_opts: client.Options = client.options("e2e-pub");
+    var cpub: client.Client;
+    if (is_err[bool, str](client.connect(?cpub, ep, ?pub_opts))) { ret 5; }
+
+    var body: [5]u8 = [5]u8{'h', 'e', 'l', 'l', 'o'};
+    if (is_err[bool, str](client.publish(?cpub, "e2e/a/v", ?body[0], 5, 1, 0))) { ret 6; }
+
+    var msg: client.Message;
+    if (is_err[bool, str](client.next_message(?csub, ?msg))) { ret 7; }
+    if (!str_equals(msg.topic, "e2e/a/v")) { ret 8; }
+    if (!payload_is(?msg, "hello")) { ret 9; }
+
+    # retained: publish retained, then a fresh subscriber receives it
+    var ropt: [2]u8 = [2]u8{'o', 'n'};
+    if (is_err[bool, str](client.publish(?cpub, "e2e/state", ?ropt[0], 2, 0, 1))) { ret 10; }
+
+    var ret_opts: client.Options = client.options("e2e-retsub");
+    var cret: client.Client;
+    if (is_err[bool, str](client.connect(?cret, ep, ?ret_opts))) { ret 11; }
+    if (is_err[u8, str](client.subscribe(?cret, "e2e/state", 0))) { ret 12; }
+    var rmsg: client.Message;
+    if (is_err[bool, str](client.next_message(?cret, ?rmsg))) { ret 13; }
+    if (!str_equals(rmsg.topic, "e2e/state")) { ret 14; }
+    if (rmsg.retain != 1) { ret 15; }
+    if (!payload_is(?rmsg, "on")) { ret 16; }
+
+    # will: a client with a will drops ungracefully, watcher gets it
+    var watch_opts: client.Options = client.options("e2e-watch");
+    var cwatch: client.Client;
+    if (is_err[bool, str](client.connect(?cwatch, ep, ?watch_opts))) { ret 17; }
+    if (is_err[u8, str](client.subscribe(?cwatch, "e2e/down", 0))) { ret 18; }
+
+    var wpay: [3]u8 = [3]u8{'b', 'y', 'e'};
+    var will_opts: client.Options = client.options("e2e-willer");
+    will_opts.will_flag = 1;
+    will_opts.will_topic = "e2e/down";
+    will_opts.will_payload = client_blob(?wpay[0], 3);
+    will_opts.will_qos = 0;
+    var cwill: client.Client;
+    if (is_err[bool, str](client.connect(?cwill, ep, ?will_opts))) { ret 19; }
+    client.close(?cwill);
+
+    var wmsg: client.Message;
+    if (is_err[bool, str](client.next_message(?cwatch, ?wmsg))) { ret 20; }
+    if (!str_equals(wmsg.topic, "e2e/down")) { ret 21; }
+    if (!payload_is(?wmsg, "bye")) { ret 22; }
+
+    client.disconnect(?csub);
+    client.disconnect(?cpub);
+    client.disconnect(?cret);
+    client.disconnect(?cwatch);
+    ret 0;
+}
+
+fun client_blob(data: *u8, len: usize) field.Blob {
+    ret field.Blob{data: data, len: len};
+}

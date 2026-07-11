@@ -9,3 +9,6 @@ fwd mqtt.packet.frame;
 fwd mqtt.broker.filter;
 fwd mqtt.broker.core;
 fwd mqtt.broker.serve;
+
+fwd mqtt.client;
+fwd mqtt.e2e;
