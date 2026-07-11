@@ -60,6 +60,7 @@ pub fun read_u16(buf: *buffer.ReadBuf) Result[u16, str] {
 # s:   null-terminated string to write
 # ret: new buffer length, or an error
 pub fun write_string(buf: *buffer.WriteBuf, s: str) Result[usize, str] {
+    if (s == nil) { ret err[usize, str]("nil string"); }
     val n: usize = str_len(s);
     if (n > 65535) { ret err[usize, str]("string exceeds 65535 bytes"); }
 
@@ -82,6 +83,13 @@ pub fun read_string(buf: *buffer.ReadBuf, a: *allocator.Allocator) Result[str, s
     val br: Result[*u8, str] = buffer.rbuf_read_bytes(buf, n);
     if (is_err[*u8, str](br)) { ret err[str, str]("truncated string body"); }
     val src: *u8 = unwrap_ok[*u8, str](br);
+
+    # reject embedded U+0000 (MQTT-1.5.3-2); a NUL would truncate the str
+    var i: usize = 0;
+    for (i < n) {
+        if (src[i] == 0) { ret err[str, str]("string contains U+0000"); }
+        i = i + 1;
+    }
 
     val ar: Result[*u8, str] = allocator.allocate[u8](a, n + 1);
     if (is_err[*u8, str](ar)) { ret err[str, str](unwrap_err[*u8, str](ar)); }
@@ -233,6 +241,27 @@ test "field: own_str copies content" {
     val r: Result[str, str] = own_str("device-42", ?a);
     if (is_err[str, str](r)) { ret 1; }
     if (!str_equals(unwrap_ok[str, str](r), "device-42")) { ret 1; }
+    ret 0;
+}
+
+test "field: write_string rejects nil" {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var wb: buffer.WriteBuf = buffer.wbuf_make(?a);
+    val r: Result[usize, str] = write_string(?wb, nil);
+    buffer.wbuf_dnit(?wb);
+    if (is_ok[usize, str](r)) { ret 1; }
+    ret 0;
+}
+
+test "field: read_string rejects embedded NUL" {
+    var a: allocator.Allocator;
+    page.make(?a);
+    # length prefix 2, then bytes 'a' 0x00
+    var raw: [4]u8 = [4]u8{0x00, 0x02, 'a', 0x00};
+    var rb: buffer.ReadBuf = buffer.rbuf_make(?raw[0], 4);
+    val r: Result[str, str] = read_string(?rb, ?a);
+    if (is_ok[str, str](r)) { ret 1; }
     ret 0;
 }
 

@@ -29,6 +29,13 @@ use field:  mqtt.packet.field;
 # error returned when the peer closed the connection
 pub val ERR_EOF: str = "eof";
 
+# largest whole packet accepted from the wire (v0.1 default: 1 MiB)
+#
+# read_packet rejects any frame whose remaining length exceeds this before
+# allocating the body, so an unauthenticated peer cannot force a large
+# allocation from an attacker-controlled length.
+pub val MAX_PACKET_SIZE: usize = 1048576;
+
 fun stream_read_cb(ctx: ptr, buf: *u8, len: usize) Result[usize, str] {
     val s: *tcp.Stream = ctx::*tcp.Stream;
     val n: i64 = tcp.stream_read(s, buf, len);
@@ -101,6 +108,8 @@ pub fun read_packet(r: *reader.Reader, a: *allocator.Allocator) Result[packet.Pa
         if (count >= 4) { ret err[packet.Packet, str]("malformed remaining length"); }
         mult = mult * 128;
     }
+
+    if (value > MAX_PACKET_SIZE) { ret err[packet.Packet, str]("packet exceeds maximum size"); }
 
     if (value == 0) {
         var empty: buffer.ReadBuf = buffer.rbuf_make(nil, 0);
@@ -224,6 +233,25 @@ test "frame: read_packet reports eof on empty stream" {
     val dr: Result[packet.Packet, str] = read_packet(?r, ?a);
     if (is_err[packet.Packet, str](dr) == 0) { ret 1; }
     if (!str_equals(unwrap_err[packet.Packet, str](dr), ERR_EOF)) { ret 1; }
+    ret 0;
+}
+
+test "frame: read_packet rejects an oversized remaining length" {
+    var a: allocator.Allocator;
+    page.make(?a);
+    # PUBLISH header then remaining length FF FF FF 7F (268435455, well over the cap)
+    var bytes: [5]u8 = [5]u8{0x30, 0xFF, 0xFF, 0xFF, 0x7F};
+    var m: MemReader;
+    m.data = ?bytes[0];
+    m.len = 5;
+    m.pos = 0;
+    var r: reader.Reader;
+    r.ctx = (?m)::ptr;
+    r.fn_read = mem_read_cb;
+
+    val dr: Result[packet.Packet, str] = read_packet(?r, ?a);
+    if (is_err[packet.Packet, str](dr) == 0) { ret 1; }
+    if (!str_equals(unwrap_err[packet.Packet, str](dr), "packet exceeds maximum size")) { ret 1; }
     ret 0;
 }
 

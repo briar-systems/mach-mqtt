@@ -404,6 +404,12 @@ fun decode_topic_list(p: *Packet, body: *buffer.ReadBuf, a: *allocator.Allocator
     ret ok[usize, str](0);
 }
 
+# expected fixed-header flag nibble for a non-PUBLISH packet type (MQTT-2.2.2-1/2)
+fun expected_flags(kind: u8) u8 {
+    if (kind == types.PUBREL || kind == types.SUBSCRIBE || kind == types.UNSUBSCRIBE) { ret 2; }
+    ret 0;
+}
+
 # parse a packet body given its already-read fixed-header byte
 # ---
 # header: fixed-header first byte
@@ -413,6 +419,13 @@ fun decode_topic_list(p: *Packet, body: *buffer.ReadBuf, a: *allocator.Allocator
 pub fun decode_body(header: u8, body: *buffer.ReadBuf, a: *allocator.Allocator) Result[Packet, str] {
     val kind: u8 = types.header_type(header);
     val flags: u8 = types.header_flags(header);
+
+    # PUBLISH carries dup/qos/retain in its flags; every other type has reserved
+    # bits that MUST match a fixed value or the packet is malformed
+    if (kind != types.PUBLISH && flags != expected_flags(kind)) {
+        ret err[Packet, str]("malformed fixed header flags");
+    }
+
     var p: Packet = zero(kind);
 
     if (kind == types.CONNECT) {
@@ -760,6 +773,24 @@ fun empty_roundtrip(kind: u8) u8 {
     val dr: Result[Packet, str] = decode(?rb, ?a);
     if (is_err[Packet, str](dr)) { ret 1; }
     if (unwrap_ok[Packet, str](dr).kind != kind) { ret 1; }
+    ret 0;
+}
+
+test "codec: rejects reserved fixed-header flags" {
+    var a: allocator.Allocator;
+    page.make(?a);
+    # SUBSCRIBE (kind 8) with flags 0000 instead of the required 0010
+    var sub_bad: [2]u8 = [2]u8{0x80, 0x00};
+    var rb1: buffer.ReadBuf = buffer.rbuf_make(?sub_bad[0], 2);
+    if (is_ok[Packet, str](decode(?rb1, ?a))) { ret 1; }
+    # PUBACK (kind 4) with flags 1111 instead of the required 0000
+    var ack_bad: [4]u8 = [4]u8{0x4F, 0x02, 0x00, 0x01};
+    var rb2: buffer.ReadBuf = buffer.rbuf_make(?ack_bad[0], 4);
+    if (is_ok[Packet, str](decode(?rb2, ?a))) { ret 1; }
+    # PUBREL (kind 6) with the correct flags 0010 still decodes
+    var rel_ok: [4]u8 = [4]u8{0x62, 0x02, 0x00, 0x01};
+    var rb3: buffer.ReadBuf = buffer.rbuf_make(?rel_ok[0], 4);
+    if (is_err[Packet, str](decode(?rb3, ?a))) { ret 1; }
     ret 0;
 }
 
