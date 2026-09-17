@@ -104,3 +104,7 @@ core.set_auth(?broker, check);
   takeover, but on a silent network partition it is delayed until the transport
   itself reports the connection closed. Enforcing the deadline is blocked on a
   stdlib read-timeout primitive.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
